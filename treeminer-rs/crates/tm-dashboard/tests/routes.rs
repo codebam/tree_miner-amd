@@ -388,6 +388,136 @@ async fn rig_serves_what_the_embedded_page_reads() {
     harness.stop().await;
 }
 
+/// The exact key set `/api/rig` serves. Third-party fleet dashboards and the embedded page
+/// both parse this payload, so a key may not be added, dropped or respelled here without a
+/// deliberate decision — `engine.cuda_streams` in particular keeps its historical spelling
+/// even though the label the page shows for it is vendor-neutral.
+#[tokio::test]
+async fn rig_key_set_is_frozen() {
+    fn keys(value: &Value) -> Vec<String> {
+        let mut keys: Vec<String> = value
+            .as_object()
+            .expect("object")
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    let harness = Harness::start(full_snapshot()).await;
+    let body = harness.json("/api/rig").await;
+
+    assert_eq!(keys(&body), ["console", "delivery", "engine", "finds", "gpus", "identity"]);
+    assert_eq!(keys(&body["identity"]), ["address", "machine_id", "name"]);
+    assert_eq!(
+        keys(&body["engine"]),
+        [
+            "cpu_hashrate",
+            "cpu_workers",
+            "cuda_streams",
+            "difficulty",
+            "fatal_durability_failure",
+            "gpu_devices",
+            "gpu_hashrate",
+            "running",
+            "total_hashrate",
+            "uptime_seconds",
+        ]
+    );
+    assert_eq!(keys(&body["finds"]), ["rejected", "super", "xnm", "xuni"]);
+    assert_eq!(
+        keys(&body["delivery"]),
+        [
+            "last_submission",
+            "last_submission_age_seconds",
+            "network",
+            "queued_total",
+            "queued_xnm",
+            "queued_xuni",
+        ]
+    );
+    assert_eq!(keys(&body["console"]), ["bind", "open", "urls"]);
+    assert_eq!(
+        keys(&body["gpus"][0]),
+        [
+            "hash_count",
+            "hashrate",
+            "index",
+            "memory_gib",
+            "memory_used_percent",
+            "name",
+            "stream",
+        ]
+    );
+    harness.stop().await;
+}
+
+/// A durability failure is served alongside `running: false`; the page turns that pair into
+/// a critical banner rather than a plain operator stop.
+#[tokio::test]
+async fn rig_reports_a_durability_failure_with_its_stopped_engine() {
+    let mut snapshot = full_snapshot();
+    snapshot.running = false;
+    snapshot.fatal_durability_failure = true;
+    snapshot.fatal_durability_reason = "journal fsync failed".into();
+    let harness = Harness::start(snapshot).await;
+    let body = harness.json("/api/rig").await;
+    assert_eq!(body["engine"]["running"], false);
+    assert_eq!(body["engine"]["fatal_durability_failure"], true);
+    // The reason is `/stats` material only; `/api/rig` never carried it.
+    assert!(body["engine"].get("fatal_durability_reason").is_none());
+    let stats = harness.json("/stats").await;
+    assert_eq!(stats["fatalDurabilityFailure"], true);
+    assert_eq!(stats["fatalDurabilityReason"], "journal fsync failed");
+    harness.stop().await;
+}
+
+/// The submission age is a plain seconds count the page formats; the "nothing submitted"
+/// case is a null, never a zero, so a fresh miner cannot render as "accepted just now".
+#[tokio::test]
+async fn last_submission_age_is_null_only_before_the_first_submission() {
+    let mut snapshot = full_snapshot();
+    snapshot.last_submission = LastSubmissionState::Accepted;
+    snapshot.last_submission_age_seconds = Some(4 * 3600);
+    let harness = Harness::start(snapshot).await;
+    let body = harness.json("/api/rig").await;
+    assert_eq!(body["delivery"]["last_submission"], "accepted");
+    assert_eq!(body["delivery"]["last_submission_age_seconds"], 14_400);
+    harness.stop().await;
+
+    let mut fresh = full_snapshot();
+    fresh.last_submission = LastSubmissionState::None;
+    fresh.last_submission_age_seconds = None;
+    let harness = Harness::start(fresh).await;
+    let body = harness.json("/api/rig").await;
+    assert_eq!(body["delivery"]["last_submission"], "none");
+    assert!(body["delivery"]["last_submission_age_seconds"].is_null());
+    harness.stop().await;
+}
+
+/// `delivery.network` is the worst of the breaker and the difficulty endpoint, so the
+/// console can read "offline" while the breaker itself is closed. The route must pass that
+/// through untouched rather than re-deriving it from `serverState`.
+#[tokio::test]
+async fn rig_network_is_the_derived_state_not_the_breaker_state() {
+    let mut snapshot = full_snapshot();
+    snapshot.network_state = NetworkState::Open;
+    if let Some(tm) = snapshot.treeminer.as_mut() {
+        tm.breaker_state = "closed".into();
+    }
+    let harness = Harness::start(snapshot).await;
+    assert_eq!(harness.json("/api/rig").await["delivery"]["network"], "offline");
+    assert_eq!(harness.json("/stats").await["serverState"], "closed");
+    harness.stop().await;
+
+    let mut probing = full_snapshot();
+    probing.network_state = NetworkState::HalfOpen;
+    let harness = Harness::start(probing).await;
+    assert_eq!(harness.json("/api/rig").await["delivery"]["network"], "probing");
+    harness.stop().await;
+}
+
 #[tokio::test]
 async fn rig_drops_gpu_entries_that_stopped_reporting() {
     let mut snapshot = full_snapshot();

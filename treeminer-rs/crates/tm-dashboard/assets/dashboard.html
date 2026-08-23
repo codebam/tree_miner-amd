@@ -95,6 +95,8 @@
     .alert.show { display: flex; animation: slidein .35s ease-out; }
     @keyframes slidein { from { opacity: 0; transform: translateY(-6px); } }
     .alert strong { color: var(--amber); }
+    .alert.crit { border-color: rgba(255, 100, 124, .55); border-left-color: var(--red); background: rgba(48, 10, 18, .92); color: #ffd2da; }
+    .alert.crit strong { color: var(--red); }
     .eyebrow { color: var(--cyan); font-size: 11px; text-transform: uppercase; letter-spacing: .09em; margin-bottom: 12px; }
     .eyebrow .index { color: var(--dim); }
     .hero {
@@ -169,6 +171,7 @@
     .delivery-row span:first-child { color: var(--muted); }
     .delivery-row strong { color: var(--ink); font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
     .queue { color: var(--amber) !important; }
+    .delivery-row strong.warn { color: var(--amber); }
     .profile { grid-template-columns: repeat(4, minmax(0, 1fr)); }
     .profile-item { position: relative; min-height: 94px; background: var(--surface); padding: 15px; transition: background .25s ease; }
     .profile-item:hover { background: var(--surface-hover); }
@@ -203,7 +206,7 @@
 <body>
   <header class="topbar">
     <div class="shell">
-      <div class="brand"><div class="brand-mark">T</div><div><div class="brand-name">HASHHEAD // TREEMINER</div><div class="brand-path">LOCAL_OPS::42069</div></div></div>
+      <div class="brand"><div class="brand-mark">T</div><div><div class="brand-name">HASHHEAD // TREEMINER</div><div class="brand-path" id="brand-path">LOCAL_OPS::42069</div></div></div>
       <div class="topside">
         <div class="themes" role="group" aria-label="Console theme">
           <button class="swatch active" data-theme-pick="hashhead" style="--sw:#2de1eb" title="Theme: HashHead" aria-label="Theme: HashHead" type="button"></button>
@@ -216,7 +219,8 @@
     </div>
   </header>
   <main class="shell">
-    <div id="outage" class="alert"><span><strong>UPSTREAM OFFLINE</strong> // Mining continues. <span id="outage-copy">Finds are held locally.</span></span><span id="outage-queue">0 secured</span></div>
+    <div id="durability" class="alert crit"><span><strong>DURABILITY FAILURE</strong> // Finds can no longer be persisted. <span id="durability-copy">The miner is shutting down.</span></span></div>
+    <div id="outage" class="alert"><span><strong id="outage-title">UPSTREAM OFFLINE</strong> // Mining continues. <span id="outage-copy">Finds are held locally.</span></span><span id="outage-queue">0 secured</span></div>
     <section class="hero">
       <div>
         <div class="eyebrow"><span class="index">[01]</span> :: ACTIVE_RIG</div>
@@ -250,7 +254,7 @@
 
     <section class="grid metrics" aria-label="Mining metrics">
       <div class="metric"><div class="metric-label">Difficulty</div><div id="difficulty" class="metric-value">--</div><div class="metric-detail">network target</div></div>
-      <div class="metric"><div class="metric-label">XNM Finds</div><div id="xnm" class="metric-value">--</div><div class="metric-detail">this session</div></div>
+      <div class="metric"><div class="metric-label">XNM Finds</div><div id="xnm" class="metric-value">--</div><div class="metric-detail" id="xnm-detail">this session</div></div>
       <div class="metric"><div class="metric-label">XUNI Finds</div><div id="xuni" class="metric-value">--</div><div class="metric-detail">this session</div></div>
       <div class="metric"><div class="metric-label">Q_XNM</div><div id="q-xnm" class="metric-value">--</div><div class="metric-detail">secured locally</div></div>
       <div class="metric"><div class="metric-label">Q_XUNI</div><div id="q-xuni" class="metric-value">--</div><div class="metric-detail">secured locally</div></div>
@@ -261,7 +265,7 @@
       <div class="section-head"><div><div class="eyebrow"><span class="index">[02]</span> :: ENGINE</div><h2>Compute & delivery</h2><p>Live worker streams and submission state</p></div></div>
       <div class="grid ops">
         <div class="panel">
-          <div class="panel-title">CUDA stream telemetry</div>
+          <div class="panel-title">GPU stream telemetry</div>
           <table><thead><tr><th>Device</th><th>Stream</th><th>Memory</th><th>Hashrate</th><th>Work</th></tr></thead><tbody id="gpu-rows"><tr><td colspan="5">Awaiting telemetry...</td></tr></tbody></table>
         </div>
         <div class="panel">
@@ -270,8 +274,9 @@
             <div class="delivery-row"><span>Network</span><strong id="delivery-network">--</strong></div>
             <div class="delivery-row"><span>Last submission</span><strong id="last-submission">--</strong></div>
             <div class="delivery-row"><span>Secured queue</span><strong id="queue-total" class="queue">--</strong></div>
+            <div class="delivery-row"><span>Rejected</span><strong id="rejected">--</strong></div>
             <div class="delivery-row"><span>CPU sidecar</span><strong id="cpu-workers">--</strong></div>
-            <div class="delivery-row"><span>CUDA streams</span><strong id="stream-count">--</strong></div>
+            <div class="delivery-row"><span>GPU streams</span><strong id="stream-count">--</strong></div>
           </div>
         </div>
       </div>
@@ -295,7 +300,7 @@
   <script>
     let snapshot = null;
     const $ = (id) => document.getElementById(id);
-    const TICK_IDS = new Set(['difficulty', 'xnm', 'xuni', 'q-xnm', 'q-xuni', 'queue-total', 'last-submission']);
+    const TICK_IDS = new Set(['difficulty', 'xnm', 'xuni', 'q-xnm', 'q-xuni', 'queue-total', 'last-submission', 'rejected']);
     const text = (id, value) => {
       const el = $(id), next = String(value);
       if (el.textContent === next) return;
@@ -317,6 +322,8 @@
       if (s < 3600) return `${Math.floor(s / 60)}m`;
       return `${Math.floor(s / 3600)}h`;
     };
+    // Past this age a submission outcome no longer describes the current uplink.
+    const STALE_SUBMISSION_SECONDS = 300;
     const escapeHtml = (value) => String(value).replace(/[&<>'"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 
     // Rolling hashrate history, ~10 min at one sample per 2.5s poll.
@@ -378,9 +385,9 @@
     function render(data) {
       snapshot = data;
       const { identity, engine, finds, delivery, gpus } = data;
-      text('rig-name', identity.name.toUpperCase());
-      text('address', identity.address);
-      text('machine', identity.machine_id);
+      text('rig-name', String(identity.name || 'TreeMiner').toUpperCase());
+      text('address', identity.address || '--');
+      text('machine', identity.machine_id || '--');
       text('total-rate', kh(engine.total_hashrate));
       text('gpu-rate', `GPU ${kh(engine.gpu_hashrate)} kH/s`);
       text('cpu-rate', `CPU ${kh(engine.cpu_hashrate)} kH/s`);
@@ -392,14 +399,26 @@
       text('uptime', duration(engine.uptime_seconds));
       text('delivery-network', delivery.network.toUpperCase());
       // A bare "ACCEPTED" from an hour ago implies a healthy uplink; the age says otherwise.
+      // Null age means nothing has been submitted yet, so there is no age to claim; the
+      // state is also "none" in that case, and "NONE 0S AGO" would be a lie either way.
       const submissionAge = delivery.last_submission_age_seconds;
-      text('last-submission', submissionAge == null
-        ? delivery.last_submission.toUpperCase()
-        : `${delivery.last_submission.toUpperCase()} ${ago(submissionAge).toUpperCase()} AGO`);
+      const submissionState = String(delivery.last_submission || 'none').toUpperCase();
+      const aged = submissionAge != null && submissionState !== 'NONE';
+      text('last-submission', aged
+        ? `${submissionState} ${ago(submissionAge).toUpperCase()} AGO`
+        : submissionState);
+      // Past this, the outcome describes an uplink that may since have died: amber, so a
+      // stale "accepted" cannot be read as a live one.
+      $('last-submission').classList.toggle('stale', aged && Number(submissionAge) >= STALE_SUBMISSION_SECONDS);
       text('queue-total', `${compact(delivery.queued_total)} finds`);
-      text('cpu-workers', `${engine.cpu_workers} workers`);
+      text('rejected', compact(finds.rejected));
+      $('rejected').classList.toggle('warn', Number(finds.rejected || 0) > 0);
+      text('cpu-workers', engine.cpu_workers ? `${engine.cpu_workers} workers` : 'disabled');
+      // The wire key third-party pollers read keeps its historical name; the label does not.
       text('stream-count', engine.cuda_streams);
-      text('profile-address', identity.address); text('profile-machine', identity.machine_id);
+      const superBlocks = Number(finds.super || 0);
+      text('xnm-detail', superBlocks > 0 ? `this session // ${compact(superBlocks)} super` : 'this session');
+      text('profile-address', identity.address || '--'); text('profile-machine', identity.machine_id || '--');
       text('profile-gpu', `${engine.gpu_devices} GPU // ${engine.cuda_streams} streams`);
       text('profile-cpu', engine.cpu_workers ? `${engine.cpu_workers} workers // ${kh(engine.cpu_hashrate)} kH/s` : 'disabled');
       const consoleUrl = (data.console && data.console.open) || '';
@@ -407,17 +426,22 @@
       text('profile-console', consoleUrl || '--');
       text('network-label', `network ${delivery.network}`);
       $('network-dot').className = `dot ${delivery.network}`;
+      const probing = delivery.network === 'probing';
       const offline = delivery.network !== 'online';
       $('outage').classList.toggle('show', offline);
-      text('outage-copy', delivery.network === 'probing' ? 'Testing the upstream connection; finds remain local.' : 'Mining continues; finds remain local until delivery resumes.');
+      text('outage-title', probing ? 'UPSTREAM PROBING' : 'UPSTREAM OFFLINE');
+      text('outage-copy', probing ? 'Testing the upstream connection; finds remain local.' : 'Mining continues; finds remain local until delivery resumes.');
       text('outage-queue', `${compact(delivery.queued_total)} secured`);
-      $('gpu-rows').innerHTML = gpus.length ? gpus.map((gpu) => `<tr><td class="primary">#${gpu.index} ${escapeHtml(gpu.name || '')}</td><td>${gpu.stream + 1}</td><td>${Number(gpu.memory_used_percent || 0).toFixed(1)}%</td><td class="signal">${kh(gpu.hashrate)} kH/s</td><td>${compact(gpu.hash_count)}</td></tr>`).join('') : '<tr><td colspan="5">No active GPU streams</td></tr>';
+      // A disk that cannot hold a find loses money silently; it outranks every other panel.
+      $('durability').classList.toggle('show', !!engine.fatal_durability_failure);
+      $('gpu-rows').innerHTML = gpus.length ? gpus.map((gpu) => `<tr><td class="primary">#${gpu.index} ${escapeHtml(gpu.name || '')}</td><td>${gpu.stream + 1}</td><td>${Number(gpu.memory_used_percent || 0).toFixed(1)}% of ${compact(gpu.memory_gib)}G</td><td class="signal">${kh(gpu.hashrate)} kH/s</td><td>${compact(gpu.hash_count)}</td></tr>`).join('') : '<tr><td colspan="5">No active GPU streams</td></tr>';
       const newFinds = prevFinds ? Math.max(0, Number(finds.xnm || 0) - prevFinds.xnm) + Math.max(0, Number(finds.xuni || 0) - prevFinds.xuni) : 0;
       prevFinds = { xnm: Number(finds.xnm || 0), xuni: Number(finds.xuni || 0) };
       pushSample(engine, newFinds);
       drawSpark();
-      text('freshness', `telemetry live // ${new Date().toLocaleTimeString()}`);
-      $('freshness').classList.remove('stale');
+      const stopped = engine.running === false;
+      text('freshness', `${stopped ? 'engine stopped' : 'telemetry live'} // ${new Date().toLocaleTimeString()}`);
+      $('freshness').classList.toggle('stale', stopped);
     }
     async function refresh() {
       try {
@@ -435,7 +459,7 @@
       if (!snapshot) return;
       const blob = new Blob([JSON.stringify(snapshot, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob), link = document.createElement('a');
-      link.href = url; link.download = `treeminer-${snapshot.identity.machine_id}-snapshot.json`; link.click();
+      link.href = url; link.download = `treeminer-${snapshot.identity.machine_id || 'rig'}-snapshot.json`; link.click();
       URL.revokeObjectURL(url);
     });
     const swatches = document.querySelectorAll('.swatch');
@@ -448,6 +472,8 @@
     }
     swatches.forEach((b) => b.addEventListener('click', () => applyTheme(b.dataset.themePick)));
     try { applyTheme(localStorage.getItem('treeminer-theme') || 'hashhead'); } catch (e) {}
+    // The console is not always on the default port; name the one this page came from.
+    text('brand-path', `LOCAL_OPS::${location.port || (location.protocol === 'https:' ? '443' : '80')}`);
     refresh(); setInterval(refresh, 2500);
   </script>
 </body>

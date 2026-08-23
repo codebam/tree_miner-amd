@@ -8,6 +8,7 @@ members = [
     "crates/tm-submit",
     "crates/tm-dashboard",
     "crates/tm-tui",
+    "crates/tm-platform",
     "crates/treeminer",
 ]
 
@@ -28,6 +29,7 @@ tm-journal = { path = "crates/tm-journal" }
 tm-submit = { path = "crates/tm-submit" }
 tm-dashboard = { path = "crates/tm-dashboard" }
 tm-tui = { path = "crates/tm-tui" }
+tm-platform = { path = "crates/tm-platform" }
 
 anyhow = "1"
 thiserror = "2"
@@ -40,6 +42,11 @@ argon2 = "0.5"
 blake2 = "0.10"
 sha2 = "0.10"
 sha3 = "0.10"
+hmac = "0.12"
+subtle = "2"
+# MQTT client for platform mode. `use-rustls` (default) keeps the TLS stack the same
+# rustls the submitter already links; no OpenSSL is pulled in.
+rumqttc = "0.24"
 k256 = { version = "0.13", features = ["ecdsa"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "blocking"] }
