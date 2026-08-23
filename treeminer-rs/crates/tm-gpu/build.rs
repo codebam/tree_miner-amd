@@ -575,6 +575,9 @@ mod nvidia {
                 // so the search path has to survive into the runtime loader too — same
                 // reason the AMD path adds an rpath for ROCm.
                 println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
+                if let Some(shim) = link_name_shim(&dir) {
+                    println!("cargo:rustc-link-search=native={}", shim.display());
+                }
             }
             None => missing_libcuda(),
         }
@@ -597,6 +600,42 @@ mod nvidia {
         roots
             .into_iter()
             .find(|dir| has_libcuda(dir))
+    }
+
+    /// `-lcuda` needs an unversioned `libcuda.so`, but a GPU container usually has only the
+    /// `libcuda.so.1` its runtime injected from the host driver — the unversioned name lives
+    /// in the CUDA toolkit's `-devel` package, which this build does not otherwise need
+    /// (the kernels are Rust, not nvcc). Rather than demand a toolkit image, point the
+    /// linker at a directory holding the missing name.
+    ///
+    /// Returns the shim directory when one was needed, `None` when the real thing is there.
+    fn link_name_shim(dir: &Path) -> Option<PathBuf> {
+        if dir.join("libcuda.so").exists() {
+            return None;
+        }
+        let versioned = dir.join("libcuda.so.1");
+        if !versioned.exists() {
+            return None;
+        }
+        let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
+        let shim_dir = out_dir.join("cuda-link");
+        std::fs::create_dir_all(&shim_dir).ok()?;
+        let link = shim_dir.join("libcuda.so");
+        if link.exists() {
+            std::fs::remove_file(&link).ok()?;
+        }
+        match std::os::unix::fs::symlink(&versioned, &link) {
+            Ok(()) => {
+                println!(
+                    "cargo:warning=linking against {} through a libcuda.so symlink: the \
+                     unversioned name is absent (a driver-only container, not a CUDA -devel \
+                     image). This is expected and does not affect the built binary.",
+                    versioned.display()
+                );
+                Some(shim_dir)
+            }
+            Err(_) => None,
+        }
     }
 
     fn has_libcuda(dir: &Path) -> bool {

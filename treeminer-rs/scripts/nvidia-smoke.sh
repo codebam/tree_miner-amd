@@ -55,11 +55,20 @@ if [ "$((CAP_MAJOR * 10 + CAP_MINOR))" -lt 70 ]; then
 fi
 pass "compute capability $CAP meets the sm_70 floor"
 
-if ! ldconfig -p 2>/dev/null | grep -q "libcuda\.so"; then
-    fail "libcuda.so not found. Use a CUDA driver image (nvidia/cuda:*-devel)."
+# The CUDA *toolkit* is not needed: these kernels are Rust compiled to PTX, not nvcc. What
+# is needed is a linkable driver library. A GPU container normally has only libcuda.so.1,
+# injected by the container runtime from the host driver; the build creates the unversioned
+# link name itself, so a driver-only image is fine and no -devel image is required.
+if ldconfig -p 2>/dev/null | grep -q "libcuda\.so"; then
+    pass "$(ldconfig -p | grep -o 'libcuda\.so[^ ]*' | sort -u | tr '\n' ' ')present"
+elif [ -e /usr/local/cuda/lib64/stubs/libcuda.so ]; then
+    export TM_CUDA_LIB_DIR=/usr/local/cuda/lib64/stubs
+    pass "using the toolkit stub at $TM_CUDA_LIB_DIR"
+else
+    fail "no libcuda found. The instance needs the NVIDIA driver visible inside the"
+    info "container — check that it was started with GPU support, not that CUDA is installed."
     exit 1
 fi
-pass "libcuda.so present"
 
 # ---------------------------------------------------------------- toolchain
 
