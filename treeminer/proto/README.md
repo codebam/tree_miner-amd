@@ -31,7 +31,7 @@ Where `worker_id` is the machine-unique identifier (`machineId` global) and
 | Topic Suffix | Description |
 |---|---|
 | `task` | Lease assignment commands (`register_ack`, `assign_task`, `release`) |
-| `control` | Operational commands (`pause`, `resume`, `shutdown`) |
+| `control` | Operational commands (`pause`, `resume`, `shutdown`, `set_config`) |
 
 ## Message Dispatch
 
@@ -41,7 +41,8 @@ different fields:
 - **`task` topic**: dispatched by the `command` field -- `register_ack`,
   `assign_task`, or `release`.
 - **`control` topic**: dispatched by the `action` field -- `pause`, `resume`,
-  or `shutdown`.
+  `shutdown`, or `set_config`. Only `set_config` carries a `config` object;
+  the other three are the `action` key alone plus the `auth` envelope.
 
 On the C++ side, if the `command` field does not match `register_ack`,
 `assign_task`, or `release`, the message is forwarded to the control handler
@@ -61,16 +62,41 @@ which reads the `action` field instead.
   - `block_found.json` - Block discovery report
   - `register_ack_accepted.json` - Registration accepted
   - `register_ack_rejected.json` - Registration rejected
-  - `assign_task.json` - Lease assignment
+  - `assign_task.json` - Lease assignment (signed)
   - `release.json` - Lease release
   - `control_pause.json` - Pause command
   - `control_resume.json` - Resume command
-  - `control_shutdown.json` - Shutdown command
+  - `control_shutdown.json` - Shutdown command (signed)
+  - `control_set_config.json` - Remote configuration change (signed)
 
-Note: The example files include `_description`, `_topic`, and `_source`
-metadata fields for documentation purposes. These fields are not part of the
-wire protocol and would not pass strict `additionalProperties: false` schema
-validation.
+Note: The example files include `_description`, `_topic`, `_source` and
+`_notes` metadata fields for documentation purposes. These fields are not part
+of the wire protocol; `tests/unit/test_proto_examples.py` strips every
+`_`-prefixed key before validating the remainder against the schema named by
+`_topic`'s suffix, and the signatures in the signed examples are computed over
+the stripped message.
+
+The signed examples are signed with the documentation secret
+`example-shared-secret` and their signatures really do verify (the test proves
+it), but their `issued_at`/`expires_at` are in the past, so a live worker would
+reject them as expired. Regenerate rather than hand-edit them: changing one byte
+of the body invalidates the signature.
+
+### Which commands require the `auth` envelope
+
+| command | envelope | why |
+|---|---|---|
+| `assign_task` | **required** | `consumer_address` redirects the lease's block rewards |
+| `set_config` | **required** | `address` redirects every future block reward |
+| `shutdown` | **required** | kills mining outright |
+| `register_ack` | optional | only confirms the registration the worker sent |
+| `release` | optional | only ends a lease and returns the rig to self-mining |
+| `pause` / `resume` | optional | cannot move money or change a mining parameter |
+
+"Optional" means only that a worker with **no** shared secret still obeys them.
+A worker configured with `TREEMINER_PLATFORM_COMMAND_SECRET` requires a valid
+envelope on *every* command, and the server refuses to publish any command at
+all without a secret (HTTP 503) rather than sending an unsigned one.
 
 ## Worker States
 

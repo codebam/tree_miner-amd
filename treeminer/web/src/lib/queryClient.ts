@@ -8,7 +8,11 @@ export const queryClient = new QueryClient({
     },
   }),
   mutationCache: new MutationCache({
-    onError: (error) => {
+    // Only the mutations that do NOT report failure themselves: this handler
+    // and a mutation's own onError both fire, so toasting unconditionally
+    // showed two toasts for every mutation that had its own handler.
+    onError: (error, _vars, _ctx, mutation) => {
+      if (mutation.options.onError) return;
       toast.error(error.message || "Operation failed");
     },
   }),

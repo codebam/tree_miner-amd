@@ -1,7 +1,15 @@
 {
-  "_description": "Shutdown control command - graceful shutdown of PlatformManager",
+  "_description": "Shutdown control command - stops the platform manager and the miner",
   "_topic": "xenminer/abc123def456/control",
-  "_source": "PlatformManager::handleControl()",
-
-  "action": "shutdown"
+  "_source": "tm_platform::manager::handle_control (ControlAction::Shutdown)",
+  "_notes": "shutdown REQUIRES an auth envelope: it kills mining, so a worker with no shared secret refuses it. Signature produced with the documentation secret 'example-shared-secret'.",
+  "action": "shutdown",
+  "auth": {
+    "worker_id": "abc123def456",
+    "command_id": "shutdown-0001",
+    "issued_at": 1700000000,
+    "expires_at": 1700000060,
+    "nonce": "9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+    "sig": "9349c4228e50e7b76b2572563d11ec50a42fe35f131af90f88fcfcdffd6841d4"
+  }
 }

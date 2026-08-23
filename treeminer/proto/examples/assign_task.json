@@ -1,13 +1,20 @@
 {
   "_description": "Lease assignment from platform - assigns worker to mine for a consumer",
   "_topic": "xenminer/abc123def456/task",
-  "_source": "PlatformManager::handleAssignTask()",
-  "_notes": "lease_id, consumer_id, consumer_address are required (accessed via msg.at()). prefix and duration_sec have defaults.",
-
+  "_source": "PlatformManager::handleAssignTask() / tm_platform::manager::handle_assign_task",
+  "_notes": "assign_task REQUIRES an auth envelope: consumer_address redirects the lease's block rewards, so a worker with no shared secret refuses the command outright. consumer_address must be EIP-55 mixed-case checksummed. The signature below is real and was produced with the documentation secret 'example-shared-secret' over this message with the _-prefixed keys and auth removed; issued_at/expires_at are in the past, so a live worker would reject it as expired.",
   "command": "assign_task",
   "lease_id": "lease-550e8400-e29b-41d4-a716-446655440000",
   "consumer_id": "consumer-7c9e6679-7425-40de-944b-e07fc1f90ae7",
-  "consumer_address": "0xaabbccddee1234567890abcdef1234567890abcd",
+  "consumer_address": "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
   "prefix": "a1b2c3d4e5f6a7b8",
-  "duration_sec": 3600
+  "duration_sec": 3600,
+  "auth": {
+    "worker_id": "abc123def456",
+    "command_id": "assign_task-0001",
+    "issued_at": 1700000000,
+    "expires_at": 1700000060,
+    "nonce": "3b1f2c0d4e5a6b7c8d9e0f1a2b3c4d5e",
+    "sig": "a036bea9e4deb75e355568a31d3736a260caa0d7b2593dc8ccc5e629df4e0495"
+  }
 }

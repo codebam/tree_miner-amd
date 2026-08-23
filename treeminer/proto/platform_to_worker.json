@@ -2,16 +2,56 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "xenminer-platform-to-worker",
   "title": "XenblocksMiner Platform-to-Worker MQTT Messages",
-  "description": "JSON schemas for all messages published by the platform and consumed by the worker via MQTT. Messages arrive on the 'task' and 'control' topic suffixes.",
+  "description": "JSON schemas for all messages published by the platform and consumed by the worker via MQTT. Messages arrive on the 'task' and 'control' topic suffixes. Every command may carry an 'auth' HMAC envelope (see $defs/auth); the commands that can move money or stop the rig REQUIRE one.",
 
   "$defs": {
+    "auth": {
+      "type": "object",
+      "description": "HMAC-SHA256 command envelope. See proto/README.md 'Command Signing' and treeminer-rs/crates/tm-platform/src/envelope.rs (the authority). The signature covers 'TMv1\\n' + worker_id + '\\n' + command_id + '\\n' + issued_at + '\\n' + expires_at + '\\n' + nonce + '\\n' + canonical_body, where canonical_body is this message with 'auth' removed, serialised with sorted keys, no whitespace and no non-ASCII escaping. REQUIRED on assign_task, shutdown and set_config: a miner with no shared secret refuses those outright, and a miner WITH a secret requires a valid envelope on every command including register_ack, release, pause and resume.",
+      "properties": {
+        "worker_id": {
+          "type": "string",
+          "description": "Machine id of the TARGET worker. Must equal the worker's own id or the command is refused, which is what stops one rig's signed command being replayed onto another.",
+          "pattern": "^[A-Za-z0-9._-]{1,128}$"
+        },
+        "command_id": {
+          "type": "string",
+          "description": "Issuer-unique command id, for correlating platform logs with rig logs.",
+          "pattern": "^[A-Za-z0-9._-]{1,128}$"
+        },
+        "issued_at": {
+          "type": "integer",
+          "description": "Unix epoch seconds, a JSON number (never a string, never a float). May be at most 30 s (CLOCK_SKEW_SEC) ahead of the worker's clock.",
+          "minimum": 0
+        },
+        "expires_at": {
+          "type": "integer",
+          "description": "Unix epoch seconds. Must be > issued_at, and expires_at - issued_at must be <= 900 (MAX_LIFETIME_SEC). Not expressible in JSON Schema; enforced by the verifier.",
+          "minimum": 0
+        },
+        "nonce": {
+          "type": "string",
+          "description": "Random hex, 16..128 characters (>= 64 bits of entropy). Unique per accepted command: the worker remembers accepted nonces until they expire and rejects a repeat.",
+          "pattern": "^[0-9a-fA-F]{16,128}$"
+        },
+        "sig": {
+          "type": "string",
+          "description": "HMAC-SHA256 of the signing string, lowercase hex, exactly 64 characters. Compared in constant time; upper-case hex also compares equal, but emit lowercase.",
+          "pattern": "^[0-9a-fA-F]{64}$"
+        }
+      },
+      "required": ["worker_id", "command_id", "issued_at", "expires_at", "nonce", "sig"],
+      "additionalProperties": false
+    },
+
     "register_ack": {
       "type": "object",
-      "description": "Registration acknowledgement. Received on xenminer/{worker_id}/task. Dispatched by command='register_ack'. Source: PlatformManager::handleRegisterAck()",
+      "description": "Registration acknowledgement. Received on xenminer/{worker_id}/task. Dispatched by command='register_ack'. Non-mutating: accepted unsigned by a worker with no shared secret. Source: PlatformManager::handleRegisterAck() / tm_platform::manager::handle_register_ack",
       "properties": {
         "command":  { "const": "register_ack", "description": "Message discriminator" },
-        "accepted": { "type": "boolean", "description": "Whether the registration was accepted" },
-        "reason":   { "type": "string",  "description": "Rejection reason (present when accepted=false, default 'unknown')" }
+        "accepted": { "type": "boolean", "description": "Whether the registration was accepted. Absent counts as a rejection." },
+        "reason":   { "type": "string",  "description": "Rejection reason (present when accepted=false, default 'unknown'). Logged only if it is 1..128 printable-ASCII characters." },
+        "auth":     { "$ref": "#/$defs/auth" }
       },
       "required": ["command", "accepted"],
       "if": { "properties": { "accepted": { "const": false } } },
@@ -21,12 +61,24 @@
 
     "assign_task": {
       "type": "object",
-      "description": "Lease assignment command. Received on xenminer/{worker_id}/task. Dispatched by command='assign_task'. Worker must be in AVAILABLE state. Source: PlatformManager::handleAssignTask()",
+      "description": "Lease assignment command. Received on xenminer/{worker_id}/task. Dispatched by command='assign_task'. Worker must be in AVAILABLE state. MUTATING: consumer_address redirects every block reward for the lease, so a valid 'auth' envelope is REQUIRED -- a worker with no shared secret refuses this command outright. Source: PlatformManager::handleAssignTask() / tm_platform::manager::handle_assign_task",
       "properties": {
-        "command":          { "const": "assign_task", "description": "Message discriminator" },
-        "lease_id":         { "type": "string",  "description": "Unique lease identifier (required, accessed via msg.at())" },
-        "consumer_id":      { "type": "string",  "description": "Consumer identifier (required, accessed via msg.at())" },
-        "consumer_address": { "type": "string",  "description": "Consumer's Ethereum address to mine for (required, accessed via msg.at())" },
+        "command":  { "const": "assign_task", "description": "Message discriminator" },
+        "lease_id": {
+          "type": "string",
+          "description": "Unique lease identifier. 1..64 characters of [A-Za-z0-9._-].",
+          "pattern": "^[A-Za-z0-9._-]{1,64}$"
+        },
+        "consumer_id": {
+          "type": "string",
+          "description": "Consumer identifier. 1..64 characters of [A-Za-z0-9._-].",
+          "pattern": "^[A-Za-z0-9._-]{1,64}$"
+        },
+        "consumer_address": {
+          "type": "string",
+          "description": "Consumer's Ethereum address to mine for. It becomes the Argon2 salt -- the payout identity for the whole lease -- so the worker validates the full EIP-55 mixed-case checksum, which this pattern cannot express. An all-lowercase or all-uppercase address is rejected by the worker.",
+          "pattern": "^0x[0-9a-fA-F]{40}$"
+        },
         "prefix": {
           "type": "string",
           "description": "16-character hex prefix for key generation. Must be exactly PLATFORM_PREFIX_LENGTH (16) chars if non-empty. Default: empty string.",
@@ -34,21 +86,28 @@
         },
         "duration_sec": {
           "type": "integer",
-          "description": "Lease duration in seconds. Default: 3600.",
-          "minimum": 1,
+          "description": "Lease duration in seconds. A minute to a week; outside that is either a typo or an attempt to pin the rig to one consumer indefinitely. Default: 3600.",
+          "minimum": 60,
+          "maximum": 604800,
           "default": 3600
-        }
+        },
+        "auth": { "$ref": "#/$defs/auth" }
       },
-      "required": ["command", "lease_id", "consumer_id", "consumer_address"],
+      "required": ["command", "lease_id", "consumer_id", "consumer_address", "auth"],
       "additionalProperties": false
     },
 
     "release": {
       "type": "object",
-      "description": "Lease release command. Received on xenminer/{worker_id}/task. Dispatched by command='release'. Ends the current lease and transitions worker back to AVAILABLE. Source: PlatformManager::handleRelease()",
+      "description": "Lease release command. Received on xenminer/{worker_id}/task. Dispatched by command='release'. Ends the current lease and transitions the worker back to AVAILABLE and to self-mining. Non-mutating: accepted unsigned by a worker with no shared secret. Source: PlatformManager::handleRelease() / tm_platform::manager::handle_release",
       "properties": {
         "command":  { "const": "release", "description": "Message discriminator" },
-        "lease_id": { "type": "string",   "description": "Lease to release. If empty or mismatched, release is ignored. Default: empty string." }
+        "lease_id": {
+          "type": "string",
+          "description": "Lease to release. Empty releases whatever lease is active; a mismatched id is ignored. Default: empty string.",
+          "pattern": "^([A-Za-z0-9._-]{1,64})?$"
+        },
+        "auth": { "$ref": "#/$defs/auth" }
       },
       "required": ["command"],
       "additionalProperties": false
@@ -56,15 +115,68 @@
 
     "control": {
       "type": "object",
-      "description": "Operational control command. Received on xenminer/{worker_id}/control. Routed to PlatformManager::handleControl() when command field is not register_ack/assign_task/release.",
+      "description": "Non-mutating operational control. Received on xenminer/{worker_id}/control, dispatched by the 'action' field. 'pause' ends any lease and drops the worker to IDLE; 'resume' re-registers and returns it to AVAILABLE. Accepted unsigned by a worker with no shared secret. Source: PlatformManager::handleControl() / tm_platform::manager::handle_control",
       "properties": {
         "action": {
           "type": "string",
           "description": "Control action to execute",
-          "enum": ["pause", "resume", "shutdown"]
-        }
+          "enum": ["pause", "resume"]
+        },
+        "auth": { "$ref": "#/$defs/auth" }
       },
       "required": ["action"],
+      "additionalProperties": false
+    },
+
+    "shutdown": {
+      "type": "object",
+      "description": "Stop the platform manager and the miner. Received on xenminer/{worker_id}/control. MUTATING: kills mining outright, so a valid 'auth' envelope is REQUIRED -- a worker with no shared secret refuses it. Source: tm_platform::manager::handle_control (ControlAction::Shutdown)",
+      "properties": {
+        "action": { "const": "shutdown", "description": "Control action to execute" },
+        "auth":   { "$ref": "#/$defs/auth" }
+      },
+      "required": ["action", "auth"],
+      "additionalProperties": false
+    },
+
+    "set_config": {
+      "type": "object",
+      "description": "Remote configuration change. Received on xenminer/{worker_id}/control, dispatched by action='set_config'. MUTATING: 'address' redirects every future block reward, so a valid 'auth' envelope is REQUIRED -- a worker with no shared secret refuses it. Every config field is optional and only the present ones are applied, but ALL present fields are validated first: one bad field rejects the whole command rather than half-applying it. Source: tm_platform::manager::handle_set_config",
+      "properties": {
+        "action": { "const": "set_config", "description": "Control action to execute" },
+        "config": { "$ref": "#/$defs/set_config_body" },
+        "auth":   { "$ref": "#/$defs/auth" }
+      },
+      "required": ["action", "config", "auth"],
+      "additionalProperties": false
+    },
+
+    "set_config_body": {
+      "type": "object",
+      "description": "The 'config' object of a set_config command. Bounds mirror tm_platform::manager::handle_set_config exactly.",
+      "properties": {
+        "difficulty": {
+          "type": "integer",
+          "description": "Argon2 memory cost, MIN_DIFFICULTY..MAX_DIFFICULTY.",
+          "minimum": 1,
+          "maximum": 10000000
+        },
+        "address": {
+          "type": "string",
+          "description": "New payout address. The highest-risk field in the protocol: it redirects every future block reward. Validated with the full EIP-55 mixed-case checksum, which this pattern cannot express; an all-lowercase or all-uppercase address is rejected. Empty is NOT accepted.",
+          "pattern": "^0x[0-9a-fA-F]{40}$"
+        },
+        "prefix": {
+          "type": "string",
+          "description": "Self-mining key prefix, 1..MAX_SELF_PREFIX_LEN (32) hex characters. Empty clears it. Note this is the SELF-mining prefix and is bounded differently from assign_task's 16-character platform prefix.",
+          "pattern": "^([0-9a-fA-F]{1,32})?$"
+        },
+        "block_pattern": {
+          "type": "string",
+          "description": "Test block pattern, 1..MAX_BLOCK_PATTERN_LEN (16) characters of [A-Za-z0-9._-]. Empty resets to the default.",
+          "pattern": "^([A-Za-z0-9._-]{1,16})?$"
+        }
+      },
       "additionalProperties": false
     }
   },
@@ -73,6 +185,8 @@
     { "$ref": "#/$defs/register_ack" },
     { "$ref": "#/$defs/assign_task" },
     { "$ref": "#/$defs/release" },
-    { "$ref": "#/$defs/control" }
+    { "$ref": "#/$defs/control" },
+    { "$ref": "#/$defs/shutdown" },
+    { "$ref": "#/$defs/set_config" }
   ]
 }

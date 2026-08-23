@@ -38,17 +38,35 @@ interface Dashboard {
   worker_count: number;
 }
 
-const stateToStatus: Record<string, "mining" | "available" | "leased"> = {
+// `state` is whatever the rig last published on its status topic
+// (proto/worker_to_platform.json: IDLE / AVAILABLE / LEASED / MINING /
+// COMPLETED / ERROR / offline), plus SELF_MINING, which only the platform
+// writes when a worker is unlisted. Only three of those were mapped, so a rig
+// actually mining under a lease rendered as an unlabelled "Idle".
+const stateToStatus: Record<string, "mining" | "available" | "leased" | "idle" | "error" | "offline"> = {
   SELF_MINING: "mining",
   AVAILABLE: "available",
   LEASED: "leased",
+  MINING: "leased",
+  COMPLETED: "available",
+  IDLE: "idle",
+  ERROR: "error",
+  offline: "offline",
 };
 
 const stateToLabel: Record<string, string> = {
   SELF_MINING: "Mining",
   AVAILABLE: "Listed",
   LEASED: "Leased",
+  MINING: "Mining (leased)",
+  COMPLETED: "Completing",
+  IDLE: "Paused",
+  ERROR: "Error",
+  offline: "Offline",
 };
+
+/** States in which the worker is committed to a consumer and must not be relisted. */
+const LEASED_STATES = new Set(["LEASED", "MINING", "COMPLETED"]);
 
 type FilterTab = "ALL" | "SELF_MINING" | "AVAILABLE" | "LEASED";
 const filterTabs: { key: FilterTab; label: string }[] = [
@@ -82,7 +100,7 @@ function PriceEditForm({
       queryClient.invalidateQueries({ queryKey: ["provider", "workers"] });
       onClose();
     },
-    onError: () => toast.error("Failed to update price"),
+    onError: (err: Error) => toast.error(err.message || "Failed to update price"),
   });
 
   const handleSave = () => {
@@ -177,16 +195,28 @@ export default function Provider() {
       apiFetch(`/api/wallet/workers/${workerId}/command`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ command: "update_config", params: { state: targetState } }),
+        // list / unlist are the endpoint's aliases; the server turns them into
+        // the miner's `resume` / `pause` control actions.
+        body: JSON.stringify({ command: targetState === "AVAILABLE" ? "list" : "unlist" }),
       }),
     onSuccess: () => {
       toast.success("Worker state updated");
       queryClient.invalidateQueries({ queryKey: ["provider", "workers"] });
     },
+    // The server refuses to publish any worker command unless the platform
+    // command secret is configured; apiFetch turns that 503 into the
+    // actionable message, so surface it verbatim rather than a generic
+    // "failed".
+    onError: (err: Error) => toast.error(err.message || "Failed to update worker"),
   });
 
   const filteredWorkers = useMemo(
-    () => (filter === "ALL" ? workers : workers.filter((w) => w.state === filter)),
+    () =>
+      filter === "ALL"
+        ? workers
+        : workers.filter((w) =>
+            filter === "LEASED" ? LEASED_STATES.has(w.state) : w.state === filter,
+          ),
     [workers, filter],
   );
 
@@ -458,7 +488,7 @@ export default function Provider() {
                       <span className="font-mono text-sm font-semibold tabular-nums" style={{ color: colors.warning.DEFAULT }}>
                         {w.price_per_min.toFixed(4)} <span className={`text-xs font-normal ${tw.textTertiary}`}>XNB/min</span>
                       </span>
-                      {w.state !== "LEASED" && (
+                      {!LEASED_STATES.has(w.state) && (
                         <button
                           onClick={() => setEditingPriceId(w.worker_id)}
                           className={`text-xs font-medium px-1.5 py-0.5 rounded transition-colors`}
@@ -494,7 +524,7 @@ export default function Provider() {
 
                 {/* Actions */}
                 <div className="mt-3 pt-3 border-t border-[#1f2835] flex items-center justify-end gap-2">
-                  {w.state === "LEASED" ? (
+                  {LEASED_STATES.has(w.state) ? (
                     <span className={`text-xs font-medium ${tw.textTertiary}`}>Leased</span>
                   ) : w.state === "AVAILABLE" ? (
                     <button
@@ -575,7 +605,7 @@ export default function Provider() {
                             {w.price_per_min.toFixed(4)}
                           </span>
                           <span className={`text-xs ${tw.textTertiary}`}>/min</span>
-                          {w.state !== "LEASED" && (
+                          {!LEASED_STATES.has(w.state) && (
                             <button
                               onClick={() => setEditingPriceId(w.worker_id)}
                               className="ml-1 p-0.5 rounded transition-colors"
@@ -591,7 +621,7 @@ export default function Provider() {
                       )}
                     </td>
                     <td className={`${tw.tableCell} text-right`}>
-                      {w.state === "LEASED" ? (
+                      {LEASED_STATES.has(w.state) ? (
                         <span className={`text-xs ${tw.textTertiary}`}>Leased</span>
                       ) : w.state === "AVAILABLE" ? (
                         <button

@@ -1,0 +1,21 @@
+{
+  "_description": "Remote configuration change - difficulty, payout address, self-mining prefix, block pattern",
+  "_topic": "xenminer/abc123def456/control",
+  "_source": "tm_platform::manager::handle_set_config",
+  "_notes": "set_config REQUIRES an auth envelope: 'address' redirects every future block reward. Every config field is optional; all present fields are validated before any is applied. Signature produced with the documentation secret 'example-shared-secret'.",
+  "action": "set_config",
+  "config": {
+    "difficulty": 1749,
+    "address": "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+    "prefix": "c0ffee",
+    "block_pattern": "XEN11"
+  },
+  "auth": {
+    "worker_id": "abc123def456",
+    "command_id": "set_config-0001",
+    "issued_at": 1700000000,
+    "expires_at": 1700000060,
+    "nonce": "0123456789abcdef0123456789abcdef",
+    "sig": "cb55c7fd402a895e6f10692db6dbde5780100f65a55210353a0e98cf33cc41b1"
+  }
+}

@@ -6,12 +6,108 @@ from typing import Optional
 from fastapi import APIRouter, Header, HTTPException, Query
 from starlette.requests import Request
 
-from server.command_signing import CommandSigningError
+from server.command_signing import CommandSecretMissing, CommandSigningError
 from server.deps import get_server
 
 router = APIRouter()
 
 OFFLINE_THRESHOLD = 90
+
+# The miner dispatches control messages by `action`, not by `command`: see
+# proto/platform_to_worker.json and tm_platform::proto::command_from_value.
+# This endpoint used to publish {"command": "restart"|"stop"|"start"|
+# "update_config"}, none of which the miner has ever recognised -- every one of
+# them was a silent no-op on the rig. These are the mappings that have a real
+# counterpart:
+#
+#   stop        -> {"action": "shutdown"}      (signed; kills mining)
+#   unlist      -> {"action": "pause"}         (ends any lease, back to self-mining)
+#   list        -> {"action": "resume"}        (re-register, become AVAILABLE)
+#   update_config -> {"action": "set_config", "config": {...}}
+#
+# `restart` and `start` are gone: a shut-down miner is not connected to the
+# broker, so "start" cannot be a broker command, and the miner has no restart
+# action. They are rejected with a 400 naming what is supported rather than
+# accepted and dropped.
+WALLET_COMMANDS = {"stop", "list", "unlist", "update_config"}
+
+#: The only keys `set_config` accepts, from tm_platform::proto::SetConfig.
+#: `state` is a platform-side listing concept and is deliberately NOT one of
+#: them -- sending it inside `config` would fail schema validation on the way
+#: out and be ignored by the miner on the way in.
+CONFIG_FIELDS = ("difficulty", "address", "prefix", "block_pattern")
+
+VALID_WORKER_STATES = {"SELF_MINING", "AVAILABLE", "LEASED"}
+
+#: Marketplace listing state -> the control action that puts the rig there.
+STATE_ACTION = {"AVAILABLE": "resume", "SELF_MINING": "pause"}
+
+
+def _control_payload(command: str, params: dict) -> dict:
+    """Translate a console command into a schema-valid control message.
+
+    Raises HTTPException(400) for anything the miner could not act on, so an
+    operator gets told instead of watching a command vanish.
+    """
+    if command not in WALLET_COMMANDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported command {command!r}; supported commands are "
+                + ", ".join(sorted(WALLET_COMMANDS))
+            ),
+        )
+
+    unknown = set(params) - set(CONFIG_FIELDS) - {"state"}
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unsupported params {sorted(unknown)}; a worker command accepts "
+                "state and " + ", ".join(CONFIG_FIELDS)
+            ),
+        )
+
+    if command == "stop":
+        if params:
+            raise HTTPException(
+                status_code=400, detail="stop takes no params"
+            )
+        return {"action": "shutdown"}
+
+    config = {k: params[k] for k in CONFIG_FIELDS if k in params}
+    if config:
+        # difficulty must be a JSON integer: the signer refuses floats outright
+        # (their JSON text is not byte-identical across implementations) and the
+        # miner's parser does not coerce strings.
+        if "difficulty" in config and (
+            isinstance(config["difficulty"], bool)
+            or not isinstance(config["difficulty"], int)
+        ):
+            raise HTTPException(
+                status_code=400, detail="difficulty must be an integer"
+            )
+        for key in ("address", "prefix", "block_pattern"):
+            if key in config and not isinstance(config[key], str):
+                raise HTTPException(
+                    status_code=400, detail=f"{key} must be a string"
+                )
+        return {"action": "set_config", "config": config}
+
+    # No config fields: this is purely a listing change, which on the rig means
+    # pause (stop offering hashpower, self-mine) or resume (register and become
+    # available).
+    state = params.get("state")
+    if state not in STATE_ACTION:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{command} needs either a config field ("
+                + ", ".join(CONFIG_FIELDS)
+                + ") or state in " + ", ".join(sorted(STATE_ACTION))
+            ),
+        )
+    return {"action": STATE_ACTION[state]}
 
 
 async def _get_wallet_address(srv, authorization: str) -> str:
@@ -159,39 +255,45 @@ async def send_worker_command(
     # Get command from request body
     body = await request.json()
     command = body.get("command")
-    params = body.get("params", {})
+    params = dict(body.get("params") or {})
 
-    allowed = {"restart", "stop", "start", "update_config", "list", "unlist"}
-    if command not in allowed:
-        raise HTTPException(status_code=400, detail="Invalid command")
-
-    valid_states = {"SELF_MINING", "AVAILABLE", "LEASED"}
-
-    # Resolve list/unlist aliases to state changes
+    # Resolve the list/unlist aliases to the state they mean, then let
+    # _control_payload turn the whole thing into a control message.
     if command == "list":
         params["state"] = "AVAILABLE"
     elif command == "unlist":
         params["state"] = "SELF_MINING"
 
-    # Persist state to DB when applicable
-    new_state = params.get("state") if command in ("update_config", "list", "unlist") else None
+    new_state = params.get("state")
+    if new_state is not None and new_state not in VALID_WORKER_STATES:
+        raise HTTPException(status_code=400, detail=f"Invalid state: {new_state}")
+
+    payload = _control_payload(command, params)
+
+    if not srv.broker:
+        raise HTTPException(status_code=503, detail="Control service unavailable")
+
+    # Check the secret BEFORE touching the database: a missing secret must fail
+    # the whole operation rather than leave the platform believing it changed a
+    # rig that never heard about it.
+    try:
+        srv.broker.require_command_secret()
+    except CommandSecretMissing as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
     if new_state:
-        if new_state not in valid_states:
-            raise HTTPException(status_code=400, detail=f"Invalid state: {new_state}")
         await srv.storage.workers.update_state(worker_id, new_state)
 
-    # Send command via MQTT
-    if srv.broker:
-        mqtt_command = "update_config" if command in ("list", "unlist") else command
-        try:
-            await srv.broker.publish_control(
-                worker_id, {"command": mqtt_command, **params}
-            )
-        except CommandSigningError as exc:
-            raise HTTPException(status_code=503, detail=str(exc))
-        return {"status": "sent", "worker_id": worker_id, "command": command}
-
-    raise HTTPException(status_code=503, detail="Control service unavailable")
+    try:
+        await srv.broker.publish_control(worker_id, payload)
+    except CommandSigningError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    return {
+        "status": "sent",
+        "worker_id": worker_id,
+        "command": command,
+        "action": payload["action"],
+    }
 
 
 @router.get("/api/wallet/share")
