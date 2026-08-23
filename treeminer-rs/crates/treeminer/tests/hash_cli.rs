@@ -552,3 +552,43 @@ fn both_gpu_spellings_report_the_same_failure_shape() {
         assert_eq!(value["backend"], Value::String(backend.to_owned()));
     }
 }
+
+/// Regression: `hash-benchmark --backend gpu` failed with "unsupported backend: gpu" while
+/// `hash-one --backend gpu` worked, because the benchmark's per-shape validation probe was
+/// the one site that skipped the canonical mapping. Found on the first NVIDIA test run,
+/// after the whole correctness suite had passed — a hole no digest test can see.
+#[test]
+fn every_subcommand_accepts_both_backend_spellings() {
+    for subcommand in ["hash-one", "hash-batch", "hash-benchmark"] {
+        for backend in ["gpu", "cuda", "cpu"] {
+            let mut args = vec![
+                "treeminer".to_owned(),
+                subcommand.to_owned(),
+                "--salt".to_owned(),
+                "e4bb184781bbc9c7004e8dafd4a9b49d203bc9bc".to_owned(),
+                "--backend".to_owned(),
+                backend.to_owned(),
+                "--difficulty".to_owned(),
+                "8".to_owned(),
+                "--seconds".to_owned(),
+                "0".to_owned(),
+                "--json".to_owned(),
+            ];
+            if subcommand == "hash-one" {
+                args.push("--key".to_owned());
+                args.push(
+                    "52a13632690c0d5a7e528c91c8462f9d68d24975d4f80cc64d20504063f3590f".to_owned(),
+                );
+            }
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            run_with(&args, &mut out, &mut err);
+            let text = String::from_utf8_lossy(&out).into_owned()
+                + &String::from_utf8_lossy(&err);
+            assert!(
+                !text.contains("unsupported backend"),
+                "{subcommand} rejected --backend {backend}: {text}"
+            );
+        }
+    }
+}

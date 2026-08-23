@@ -688,7 +688,11 @@ fn run_benchmark(
         let mut probe = request.clone();
         probe.difficulty = difficulties[if difficulties.len() == 1 { 0 } else { index }];
         probe.batch_size = batch_sizes[if batch_sizes.len() == 1 { 0 } else { index }];
-        if let Err(errors) = tm_argon2::validate_request(&probe) {
+        // Through with_canonical_backend like every other validation site: tm-argon2 knows
+        // only the wire name, so a probe built from a `gpu` request would be rejected as an
+        // unsupported backend — which is exactly what hash-benchmark did while hash-one
+        // worked, because this was the one site that skipped the mapping.
+        if let Err(errors) = tm_argon2::validate_request(&with_canonical_backend(&probe)) {
             let message = if difficulty_sequence.is_empty() && batch_size_sequence.is_empty() {
                 errors.to_string()
             } else {

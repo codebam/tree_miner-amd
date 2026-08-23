@@ -53,6 +53,9 @@ clamp, and the host argument list matches the PTX `.param` list parameter for pa
   net — they compare final digests, not intermediate blocks.
 - **No sustained run.** Minutes of hashing, not hours, and no block has ever been submitted
   from this path.
+
+Measured on that card: 5130 H/s at m=60000, 8686 H/s at m=42069, 40944 H/s at m=8192 —
+ahead of a 24 GB RX 7900 XTX at the lower two, behind at 60000 where 16 GB bounds the batch.
 - **The sm_70 floor stands**: Pascal, the GTX 10-series and P106 cards cannot run this PTX at
   all. `TM_PTX_ARCH` emits natively for a newer card; the default sm_70 build is portable and
   JIT-compiled by the driver at load.

@@ -51,6 +51,7 @@ fn every_example_file_is_covered() {
         "block_found.json",
         "control_pause.json",
         "control_resume.json",
+        "control_set_config.json",
         "control_shutdown.json",
         "heartbeat.json",
         "register.json",
@@ -154,6 +155,27 @@ fn control_examples_parse() {
         };
         assert_eq!(action, expected, "{file}");
     }
+}
+
+/// `set_config` carries a body, so it dispatches differently from the bare control actions
+/// and needs its own case. The example was added with the schema; this is the test that
+/// `every_example_file_is_covered` was demanding when it failed.
+#[test]
+fn the_set_config_example_parses_with_its_body() {
+    let Command::Control(action) = command_from_value(&load("control_set_config.json")).unwrap()
+    else {
+        panic!("control_set_config.json dispatched to the wrong handler");
+    };
+    let ControlAction::SetConfig { config } = action else {
+        panic!("expected a SetConfig action, got {action:?}");
+    };
+    assert!(
+        config.difficulty.is_some()
+            || config.address.is_some()
+            || config.prefix.is_some()
+            || config.block_pattern.is_some(),
+        "the example should set at least one field, got {config:?}"
+    );
 }
 
 /// The server's `/api/workers/{id}/control` always sends `{"action": ..., "config": {...}}`,

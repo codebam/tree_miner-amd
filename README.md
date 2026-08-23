@@ -77,13 +77,17 @@ nix build --impure --expr \
   '(builtins.getFlake (toString ./.)).packages.x86_64-linux.treeminer.override { gpuArch = "gfx1030"; }'
 ```
 
-Throughput on an idle RX 7900 XTX, against the C++ miner this was ported from:
+Throughput on an idle RX 7900 XTX, against the C++ miner this was ported from, plus an
+RTX 5070 Ti on the NVIDIA path for comparison:
 
-| difficulty | C++/HIP | Rust |
-|---|---|---|
-| 60000 | 3215 H/s | **5289 H/s** |
-| 42069 | 5529 H/s | **7891 H/s** |
-| 8192 | 19694 H/s | **39672 H/s** |
+| difficulty | C++/HIP (7900 XTX) | Rust (7900 XTX, 24 GB) | Rust (5070 Ti, 16 GB) |
+|---|---|---|---|
+| 60000 | 3215 H/s | **5289 H/s** | 5130 H/s |
+| 42069 | 5529 H/s | **7891 H/s** | **8686 H/s** |
+| 8192 | 19694 H/s | **39672 H/s** | **40944 H/s** |
+
+The 5070 Ti leads at the difficulties where the batch fits comfortably and trails at 60000,
+where its 16 GB bounds the batch the planner can choose — memory, not architecture.
 
 The Argon2 kernel is the reason: it keeps the per-thread scratch in registers instead of
 round-tripping 1 KiB of LDS per block, `4*m` times per hash.
