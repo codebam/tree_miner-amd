@@ -9,7 +9,7 @@ authority — read it before changing anything here.
 | vendor | build | status |
 | --- | --- | --- |
 | **AMD** — HIP / ROCm, `amdgcn-amd-amdhsa` | `cargo build` (default) | **Tested** on an RX 7900 XTX (gfx1100, ROCm 7.2) |
-| **NVIDIA** — CUDA / PTX, `nvptx64-nvidia-cuda` | `cargo build --no-default-features --features nvidia` | **Compiles. Never executed.** |
+| **NVIDIA** — CUDA / PTX, `nvptx64-nvidia-cuda` | `cargo build --no-default-features --features nvidia` | **Tested** on an RTX 5070 Ti (sm_120, native PTX). Read the caveats below before trusting another architecture. |
 
 The two are mutually exclusive — they link different device runtimes — and enabling both is
 a compile error.
@@ -26,28 +26,41 @@ a compile error.
 - The one-shot kernel runs with zero register spills and no LDS, at roughly 1.5x the HIP
   kernel's hashrate.
 
-### NVIDIA: what "never executed" means
+### NVIDIA: what is and is not proven
 
-Exactly what it says. **There is no NVIDIA GPU on the machine this was written on.** No
-digest, no kernel launch, no `cuInit` has ever happened on this path. What has been checked
-is only what can be checked without a device:
+The kernels have now executed on real NVIDIA hardware. On an RTX 5070 Ti (compute
+capability 12.0, native `sm_120` PTX, driver-only container):
 
-- the shared Argon2 kernel source compiles for `nvptx64-nvidia-cuda`;
-- the emitted PTX contains both `argon2_first_blocks_kernel` and `argon2_kernel_oneshot`;
-- the PTX is self-contained — no `.extern .func` the CUDA JIT would fail to resolve;
-- every cross-lane shuffle is `shfl.sync.idx.b32` / `shfl.sync.bfly.b32` with a full-warp
-  member mask and a width-32 clamp, which is what the C++ `__shfl_sync(..., 32)` means;
-- the host's `cuLaunchKernel` argument list matches, parameter for parameter and width for
-  width, the `.param` list the PTX declares;
-- the CUDA driver-API host layer compiles.
+- all **44 fixture vectors reproduce byte for byte**, on both the CPU- and GPU-first-block
+  paths, including the batched variant that catches pool-stride bugs a single-job test
+  cannot;
+- CPU and GPU digests agree through the shipped binary at m=8, 64, 1024 and 8192;
+- an over-large pool is refused by the driver rather than silently falling back.
 
-None of that says the kernels compute Argon2 correctly on NVIDIA hardware. An invalid digest
-is accepted locally and rejected by the server *after* the work is spent — this project has
-already shipped that bug once (commit 12e241c) and it cost real submissions.
+Plus what was already checkable without a device: the PTX is self-contained (no
+`.extern .func` for the JIT to choke on), every cross-lane shuffle is
+`shfl.sync.idx.b32` / `shfl.sync.bfly.b32` with a full-warp member mask and a width-32
+clamp, and the host argument list matches the PTX `.param` list parameter for parameter.
 
-**If you have an NVIDIA card, you are the first.** On a rented cloud GPU, one command does
-the whole thing — toolchain, build, and the gates in order, refusing to start on a card below
-the sm_70 floor so an hour is not spent discovering that:
+**What that does not cover**, and matters if you are not on Blackwell:
+
+- **One architecture.** sm_120 only. The shuffle translation is wave-width-correct by
+  construction and the same source drives every target, but sm_70 through sm_90 have not
+  been executed. Running `scripts/nvidia-smoke.sh` on another card is a 15-minute, ~$0.20
+  contribution.
+- **No differential oracle.** On AMD every kernel claim is checked against the hipcc kernel's
+  raw block output. NVIDIA has no such counterpart, so the 44 vectors are the whole safety
+  net — they compare final digests, not intermediate blocks.
+- **No sustained run.** Minutes of hashing, not hours, and no block has ever been submitted
+  from this path.
+- **The sm_70 floor stands**: Pascal, the GTX 10-series and P106 cards cannot run this PTX at
+  all. `TM_PTX_ARCH` emits natively for a newer card; the default sm_70 build is portable and
+  JIT-compiled by the driver at load.
+
+**If you have an NVIDIA card that is not Blackwell, you are the first for that
+architecture.** On a rented cloud GPU, one command does the whole thing — toolchain, build,
+and the gates in order, refusing to start on a card below the sm_70 floor so an hour is not
+spent discovering that:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/codebam/tree_miner-amd/main/treeminer-rs/scripts/nvidia-smoke.sh | bash
@@ -60,9 +73,8 @@ cargo test -p tm-gpu --no-default-features --features nvidia   # fixtures on the
 tests/parity/run_parity.sh                                     # against the C++ miner, if you have it built
 ```
 
-Until those pass on real hardware, this is a compilation exercise. Please report the result:
-the GPU model, its compute capability, and the throughput lines. That is what moves the row
-above from "compiles" to "tested".
+Please report the result: the GPU model, its compute capability, and the throughput lines.
+That is what extends the row above beyond the one architecture it currently covers.
 
 Known NVIDIA limitations before you start:
 

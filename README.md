@@ -67,7 +67,7 @@ console off the LAN.
 | vendor | status |
 |---|---|
 | AMD (ROCm/HIP) | Tested on an RX 7900 XTX (gfx1100, ROCm 7.2) |
-| NVIDIA (CUDA/PTX) | **Compiles, never executed.** `sm_70`+ only. See `treeminer-rs/README.md` before trusting it |
+| NVIDIA (CUDA/PTX) | Tested on an RTX 5070 Ti (sm_120). `sm_70`+ only; other NVIDIA architectures are untested — see `treeminer-rs/README.md` |
 
 The flake pins `gfx1100`, because a GPU module is loaded for exactly one architecture. On a
 different card, override it — otherwise the miner fails to load its kernel at startup:
