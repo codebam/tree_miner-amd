@@ -45,14 +45,24 @@ None of that says the kernels compute Argon2 correctly on NVIDIA hardware. An in
 is accepted locally and rejected by the server *after* the work is spent — this project has
 already shipped that bug once (commit 12e241c) and it cost real submissions.
 
-**If you have an NVIDIA card, you are the first.** Before trusting a submission from it:
+**If you have an NVIDIA card, you are the first.** On a rented cloud GPU, one command does
+the whole thing — toolchain, build, and the gates in order, refusing to start on a card below
+the sm_70 floor so an hour is not spent discovering that:
 
 ```sh
-cargo test -p tm-gpu --no-default-features --features nvidia   # fixtures + self-test on the card
-tests/parity/run_parity.sh                                     # against the C++ miner
+curl -fsSL https://raw.githubusercontent.com/codebam/tree_miner-amd/main/treeminer-rs/scripts/nvidia-smoke.sh | bash
 ```
 
-Until those pass on real hardware, this is a compilation exercise. Please report the result.
+Or by hand, from a checkout:
+
+```sh
+cargo test -p tm-gpu --no-default-features --features nvidia   # fixtures on the card
+tests/parity/run_parity.sh                                     # against the C++ miner, if you have it built
+```
+
+Until those pass on real hardware, this is a compilation exercise. Please report the result:
+the GPU model, its compute capability, and the throughput lines. That is what moves the row
+above from "compiles" to "tested".
 
 Known NVIDIA limitations before you start:
 
