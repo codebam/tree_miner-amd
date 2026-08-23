@@ -146,13 +146,24 @@ bold "== Gate 1: fixture vectors (the whole safety net on NVIDIA)"
 info "There is no hipcc oracle on this vendor, so these 44 vectors are the only thing"
 info "standing between a subtly wrong kernel and blocks the server rejects."
 
-if TM_PTX_ARCH="$NATIVE_ARCH" cargo test -p tm-gpu "${NV[@]}" -- --nocapture 2>&1 | tail -30 ||
-   cargo test -p tm-gpu "${NV[@]}" -- --nocapture 2>&1 | tail -30; then
-    pass "tm-gpu suite passed"
+# Run the vector test on its own first. cargo stops at the first failing test *binary*, so
+# folding this into the whole suite means an unrelated failure elsewhere can leave the gate
+# that actually matters unexecuted — while the summary claims it failed.
+if TM_PTX_ARCH="$NATIVE_ARCH" cargo test -p tm-gpu "${NV[@]}" --test gpu_vectors -- --nocapture 2>&1 | tail -20; then
+    pass "all 44 fixture vectors reproduce byte for byte"
     record ok "fixture vectors"
 else
-    fail "fixture vectors did NOT reproduce — the kernel is wrong. Stop here."
+    fail "fixture vectors did NOT reproduce — the kernel computes wrong digests. Stop here."
     record fail "fixture vectors"
+fi
+
+bold "== Gate 1b: the rest of the tm-gpu suite"
+if TM_PTX_ARCH="$NATIVE_ARCH" cargo test -p tm-gpu "${NV[@]}" -- --nocapture 2>&1 | tail -30; then
+    pass "tm-gpu suite passed"
+    record ok "tm-gpu suite"
+else
+    fail "something else in the tm-gpu suite failed — see above; the vector result stands on its own"
+    record fail "tm-gpu suite"
 fi
 
 # ---------------------------------------------------------------- gate 2
@@ -190,15 +201,21 @@ fi
 
 bold "== Gate 3: throughput (only meaningful if the gates above passed)"
 
+measured=0
 for difficulty in 42069 8192; do
+    # Plain output, not --json: this line is for a human, and one more layer of quoting
+    # between bash and python is one more thing to get wrong on a rented clock.
     line=$("$MINER" hash-benchmark --salt "$SALT" --backend gpu --seconds 8 \
-        --auto-batch-size --difficulty "$difficulty" --no-xuni --json 2>/dev/null |
-        python3 -c 'import json,sys
-d=json.load(sys.stdin)
-print(f"batch={d[\"batch_size\"]:6d}  {d[\"hashrate\"]:10.1f} H/s" if d["ok"] else "ERROR: "+d["error"])')
+        --auto-batch-size --difficulty "$difficulty" --no-xuni 2>&1 | tail -1)
     info "m=$difficulty  $line"
+    case "$line" in *hashrate=*) measured=$((measured + 1)) ;; esac
 done
-record ok "throughput measured"
+if [ "$measured" -eq 2 ]; then
+    record ok "throughput measured"
+else
+    fail "throughput could not be measured"
+    record fail "throughput measured"
+fi
 
 # ---------------------------------------------------------------- summary
 

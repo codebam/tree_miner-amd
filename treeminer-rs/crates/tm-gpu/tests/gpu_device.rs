@@ -50,9 +50,12 @@ fn a_batch_far_too_large_for_vram_fails_as_an_error() {
     let error = backend
         .init(&shape, batch_size)
         .expect_err("an impossible pool must fail, not silently fall back to host memory");
+    // The point is that the driver refused — not which driver it was. Asserting the HIP
+    // variant made this test vendor-specific, and on CUDA it failed on a correct refusal
+    // (`cuMemAlloc failed: out of memory`), which is the behaviour it exists to demand.
     assert!(
-        matches!(error, GpuError::Hip { .. }),
-        "expected a HIP allocation error, got {error}"
+        matches!(error, GpuError::Hip { .. } | GpuError::Cuda { .. }),
+        "expected a driver allocation error, got {error}"
     );
     assert!(backend.runner().is_none(), "a failed init must leave no pool");
 }
