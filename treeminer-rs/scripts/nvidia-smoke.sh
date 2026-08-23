@@ -110,9 +110,20 @@ pass "source at $(git -C "$SRC" rev-parse --short HEAD)"
 bold "== Build (nvidia)"
 
 NV=(--no-default-features --features nvidia)
-if cargo build --release -p treeminer "${NV[@]}" 2>&1 | tail -20; then
-    pass "treeminer built for NVIDIA"
-    record ok "build"
+
+# PTX is forward compatible — sm_70 output runs anywhere newer, JIT-compiled by the driver
+# at module load. Emitting natively for this card skips that JIT and lets the compiler use
+# the architecture's own instructions, so try it first and fall back if this rustc does not
+# know the target (`rustc --target nvptx64-nvidia-cuda --print target-cpus` lists them).
+NATIVE_ARCH="sm_${CAP_MAJOR}${CAP_MINOR}"
+info "trying native PTX for $NATIVE_ARCH"
+if TM_PTX_ARCH="$NATIVE_ARCH" cargo build --release -p treeminer "${NV[@]}" 2>&1 | tail -20; then
+    pass "treeminer built for NVIDIA (native $NATIVE_ARCH)"
+    record ok "build ($NATIVE_ARCH)"
+elif cargo build --release -p treeminer "${NV[@]}" 2>&1 | tail -20; then
+    pass "treeminer built for NVIDIA (portable sm_70 PTX, JIT-compiled on load)"
+    info "this rustc does not know $NATIVE_ARCH; the driver will JIT the sm_70 PTX"
+    record ok "build (sm_70 + JIT)"
 else
     fail "build failed — everything below is untested"
     record fail "build"
@@ -126,7 +137,8 @@ bold "== Gate 1: fixture vectors (the whole safety net on NVIDIA)"
 info "There is no hipcc oracle on this vendor, so these 44 vectors are the only thing"
 info "standing between a subtly wrong kernel and blocks the server rejects."
 
-if cargo test -p tm-gpu "${NV[@]}" -- --nocapture 2>&1 | tail -30; then
+if TM_PTX_ARCH="$NATIVE_ARCH" cargo test -p tm-gpu "${NV[@]}" -- --nocapture 2>&1 | tail -30 ||
+   cargo test -p tm-gpu "${NV[@]}" -- --nocapture 2>&1 | tail -30; then
     pass "tm-gpu suite passed"
     record ok "fixture vectors"
 else

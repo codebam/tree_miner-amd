@@ -276,9 +276,12 @@ mod gpu_kernel {
     /// will carry an unresolved `.extern .func` and `cuModuleLoadData` will fail to JIT it;
     /// `ptx_is_self_contained` in `src/cuda/module.rs` is the test that catches it first.
     ///
-    /// `-Ctarget-cpu` is left at the target default, `sm_70`. It is also the *lowest* value
-    /// this rustc accepts for nvptx64, so anything older than Volta cannot be targeted at
-    /// all from here.
+    /// `-Ctarget-cpu` defaults to `sm_70`, the lowest value this rustc accepts for nvptx64
+    /// (so anything older than Volta cannot be targeted at all) and the most portable: PTX
+    /// is forward compatible, and the driver JIT-compiles it for whatever card it is loaded
+    /// on. `TM_PTX_ARCH=sm_120` overrides it to emit natively for a newer architecture,
+    /// which skips the load-time JIT and lets the compiler use that architecture's
+    /// instructions — at the cost of a module that older cards cannot load.
     pub fn build_nvptx() {
         let manifest = kernel_manifest();
 
@@ -288,6 +291,13 @@ mod gpu_kernel {
         let wrapper = write_rustc_wrapper(&out_dir, &rustc, &sysroot);
 
         let target_dir = out_dir.join("ptx-target");
+        println!("cargo:rerun-if-env-changed=TM_PTX_ARCH");
+        let arch = std::env::var("TM_PTX_ARCH").unwrap_or_else(|_| "sm_70".to_owned());
+        assert!(
+            arch.starts_with("sm_") && arch.len() > 3,
+            "TM_PTX_ARCH must name an nvptx target-cpu such as sm_70 or sm_120, got {arch:?}"
+        );
+
         let mut command = Command::new("cargo");
         command
             .arg("rustc")
@@ -300,6 +310,7 @@ mod gpu_kernel {
             .arg("-Zbuild-std=core")
             .arg("--")
             .arg("--emit=asm")
+            .arg(format!("-Ctarget-cpu={arch}"))
             .arg("-Ccodegen-units=1")
             .env("RUSTC_BOOTSTRAP", "1")
             .env("RUSTC", &wrapper)
@@ -317,6 +328,7 @@ mod gpu_kernel {
         std::fs::copy(&ptx, &destination)
             .unwrap_or_else(|error| panic!("copying {}: {error}", ptx.display()));
         println!("cargo:rustc-env=TM_PTX_KERNEL={}", destination.display());
+        println!("cargo:rustc-env=TM_PTX_ARCH_BUILT={arch}");
     }
 
     /// The `.s` rustc just wrote. `cargo rustc --emit=asm` names it after the crate *and* a
