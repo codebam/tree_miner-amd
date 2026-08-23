@@ -6,10 +6,11 @@
 //! here reaches into a renderer, and neither renderer reaches into mining state.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use tm_dashboard::stats::{
-    JournalCounts as DashJournalCounts, StatsSnapshot, StatsSource, SubmissionMetrics,
-    TreeminerStats,
+    JournalCounts as DashJournalCounts, LastSubmissionState, StatsSnapshot, StatsSource,
+    SubmissionMetrics, TreeminerStats,
 };
 use tm_submit::{BreakerState, Metrics};
 use tm_tui::snapshot::{
@@ -71,12 +72,84 @@ impl BreakerStateLabel {
         }
     }
 
-    pub fn tui_state(self) -> NetworkState {
-        match self {
-            BreakerStateLabel::Closed => NetworkState::Online,
-            BreakerStateLabel::HalfOpen => NetworkState::Probing,
-            BreakerStateLabel::Open => NetworkState::Offline,
+    pub fn from_dashboard_state(state: tm_dashboard::stats::NetworkState) -> Self {
+        match state {
+            tm_dashboard::stats::NetworkState::Closed => BreakerStateLabel::Closed,
+            tm_dashboard::stats::NetworkState::HalfOpen => BreakerStateLabel::HalfOpen,
+            tm_dashboard::stats::NetworkState::Open => BreakerStateLabel::Open,
         }
+    }
+}
+
+/// What the console and the TUI actually report for "network".
+///
+/// The breaker alone is not it. The breaker only ever observes submission *attempts*, so a
+/// queue holding nothing submittable — every find XUNI, waiting on its :55-:05 window —
+/// keeps it Closed straight through an outage the difficulty poller is already logging as
+/// `difficulty endpoint DOWN`. Both surfaces then claim "online" while nothing can reach the
+/// server. The logs ticker already ORs the poller in (`../treeminer/src/main.cpp:851`);
+/// this is the same widening for the other two surfaces, in one place so they cannot
+/// disagree with each other.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum EffectiveNetworkState {
+    #[default]
+    Online,
+    Probing,
+    Offline,
+}
+
+impl EffectiveNetworkState {
+    pub fn dashboard(self) -> tm_dashboard::stats::NetworkState {
+        match self {
+            EffectiveNetworkState::Online => tm_dashboard::stats::NetworkState::Closed,
+            EffectiveNetworkState::Probing => tm_dashboard::stats::NetworkState::HalfOpen,
+            EffectiveNetworkState::Offline => tm_dashboard::stats::NetworkState::Open,
+        }
+    }
+
+    pub fn tui(self) -> NetworkState {
+        match self {
+            EffectiveNetworkState::Online => NetworkState::Online,
+            EffectiveNetworkState::Probing => NetworkState::Probing,
+            EffectiveNetworkState::Offline => NetworkState::Offline,
+        }
+    }
+}
+
+/// The worse of the two signals: a tripped breaker or an unreachable difficulty endpoint is
+/// Offline, a probing breaker with a reachable endpoint is Probing, and only both healthy is
+/// Online.
+pub fn effective_network_state(
+    breaker: BreakerStateLabel,
+    difficulty_endpoint_down: bool,
+) -> EffectiveNetworkState {
+    match breaker {
+        BreakerStateLabel::Open => EffectiveNetworkState::Offline,
+        _ if difficulty_endpoint_down => EffectiveNetworkState::Offline,
+        BreakerStateLabel::HalfOpen => EffectiveNetworkState::Probing,
+        BreakerStateLabel::Closed => EffectiveNetworkState::Online,
+    }
+}
+
+/// Compact age for the delivery surfaces: `45s`, `4m`, `2h`. Rounds down, so a label never
+/// claims more time has passed than has.
+pub fn format_age(age: Duration) -> String {
+    let seconds = age.as_secs();
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m", seconds / 60),
+        _ => format!("{}h", seconds / 3600),
+    }
+}
+
+/// The delivery line's uplink cell. Without an age — nothing submitted yet — it is the bare
+/// state label, which for that case reads "none".
+pub fn last_submission_label(state: LastSubmissionState, age: Option<Duration>) -> String {
+    match age {
+        Some(age) if state != LastSubmissionState::None => {
+            format!("{} {} ago", state.label(), format_age(age))
+        }
+        _ => state.label().to_owned(),
     }
 }
 
@@ -139,6 +212,14 @@ impl StatsPublisher {
         self.journal.as_ref().and_then(|provider| provider())
     }
 
+    /// One derivation, feeding both the console gauge and the TUI panel.
+    fn effective_network_state(&self) -> EffectiveNetworkState {
+        effective_network_state(
+            BreakerStateLabel::from_dashboard_state(self.state.network_state()),
+            self.state.difficulty_endpoint_down(),
+        )
+    }
+
     /// Everything the read-only console serves.
     pub fn stats_snapshot(&self) -> StatsSnapshot {
         let state = &self.state;
@@ -181,8 +262,9 @@ impl StatsPublisher {
             super_blocks: state.super_blocks() as i64,
             xuni_blocks: state.xuni_blocks() as i64,
             failed_blocks: state.failed_blocks() as i64,
-            network_state: state.network_state(),
+            network_state: self.effective_network_state().dashboard(),
             last_submission: state.last_submission(),
+            last_submission_age_seconds: state.last_submission_age().map(|age| age.as_secs()),
             queued_xnm: state.queued_xnm(),
             queued_xuni: state.queued_xuni(),
             fatal_durability_failure: state.fatal_durability_failure(),
@@ -226,7 +308,6 @@ impl StatsPublisher {
     pub fn miner_snapshot(&self) -> MinerSnapshot {
         let state = &self.state;
         let gpus = state.gpu_stats();
-        let submission = self.submission_view();
         MinerSnapshot {
             identity: Identity {
                 name: if self.identity.custom_name.is_empty() {
@@ -253,11 +334,11 @@ impl StatsPublisher {
                 rejected: state.failed_blocks() as usize,
             },
             delivery: DeliveryStats {
-                network: submission
-                    .as_ref()
-                    .map(|view| view.breaker.tui_state())
-                    .unwrap_or_default(),
-                last_submission: state.last_submission().label().to_owned(),
+                network: self.effective_network_state().tui(),
+                last_submission: last_submission_label(
+                    state.last_submission(),
+                    state.last_submission_age(),
+                ),
                 queued_xnm: state.queued_xnm() as usize,
                 queued_xuni: state.queued_xuni() as usize,
             },
@@ -469,5 +550,110 @@ mod tests {
             .ticker_snapshot();
         assert_eq!(ticker.outage_ms, 45_000);
         assert!(!ticker.pool_down);
+    }
+
+    #[test]
+    fn the_effective_state_is_the_worse_of_the_breaker_and_the_difficulty_endpoint() {
+        use BreakerStateLabel::*;
+        use EffectiveNetworkState as E;
+        let table = [
+            (Closed, false, E::Online),
+            // The report that prompted this: nothing submittable in the queue leaves the
+            // breaker Closed for the whole outage, so the poller is the only witness.
+            (Closed, true, E::Offline),
+            (HalfOpen, false, E::Probing),
+            (HalfOpen, true, E::Offline),
+            (Open, false, E::Offline),
+            (Open, true, E::Offline),
+        ];
+        for (breaker, endpoint_down, expected) in table {
+            assert_eq!(
+                effective_network_state(breaker, endpoint_down),
+                expected,
+                "breaker={breaker:?} endpoint_down={endpoint_down}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_surfaces_spell_the_same_effective_state() {
+        use BreakerStateLabel::*;
+        for breaker in [Closed, HalfOpen, Open] {
+            for endpoint_down in [false, true] {
+                let effective = effective_network_state(breaker, endpoint_down);
+                assert_eq!(effective.dashboard().label(), effective.tui().as_str());
+            }
+        }
+    }
+
+    #[test]
+    fn the_age_format_switches_unit_at_a_minute_and_an_hour() {
+        assert_eq!(format_age(Duration::from_secs(0)), "0s");
+        assert_eq!(format_age(Duration::from_secs(59)), "59s");
+        assert_eq!(format_age(Duration::from_secs(60)), "1m");
+        assert_eq!(format_age(Duration::from_secs(245)), "4m");
+        assert_eq!(format_age(Duration::from_secs(3599)), "59m");
+        assert_eq!(format_age(Duration::from_secs(3600)), "1h");
+        assert_eq!(format_age(Duration::from_secs(86_400)), "24h");
+    }
+
+    #[test]
+    fn the_uplink_label_carries_an_age_only_once_something_was_submitted() {
+        assert_eq!(last_submission_label(LastSubmissionState::None, None), "none");
+        assert_eq!(
+            last_submission_label(LastSubmissionState::None, Some(Duration::from_secs(30))),
+            "none",
+            "no submission means no age, whatever the clock says"
+        );
+        assert_eq!(
+            last_submission_label(LastSubmissionState::Accepted, Some(Duration::from_secs(245))),
+            "accepted 4m ago"
+        );
+        assert_eq!(
+            last_submission_label(LastSubmissionState::Accepted, None),
+            "accepted"
+        );
+    }
+
+    #[test]
+    fn a_closed_breaker_with_a_dead_difficulty_endpoint_reports_offline_on_both_surfaces() {
+        let state = Arc::new(MiningState::for_test(1727));
+        state.set_network_state(tm_dashboard::stats::NetworkState::Closed);
+        state.set_difficulty_endpoint_down(true);
+        let publisher = publisher(Arc::clone(&state));
+
+        assert_eq!(
+            publisher.stats_snapshot().network_state,
+            tm_dashboard::stats::NetworkState::Open
+        );
+        assert_eq!(publisher.miner_snapshot().delivery.network, NetworkState::Offline);
+
+        state.set_difficulty_endpoint_down(false);
+        assert_eq!(
+            publisher.stats_snapshot().network_state,
+            tm_dashboard::stats::NetworkState::Closed
+        );
+        assert_eq!(publisher.miner_snapshot().delivery.network, NetworkState::Online);
+    }
+
+    #[test]
+    fn an_aged_submission_reports_its_age_on_both_surfaces() {
+        let state = Arc::new(MiningState::for_test(1727));
+        let publisher = publisher(Arc::clone(&state));
+
+        assert_eq!(publisher.miner_snapshot().delivery.last_submission, "none");
+        assert_eq!(publisher.stats_snapshot().last_submission_age_seconds, None);
+
+        state.set_last_submission(LastSubmissionState::Accepted);
+        state.backdate_last_submission(Duration::from_secs(245));
+
+        assert_eq!(
+            publisher.miner_snapshot().delivery.last_submission,
+            "accepted 4m ago"
+        );
+        assert_eq!(
+            publisher.stats_snapshot().last_submission_age_seconds,
+            Some(245)
+        );
     }
 }

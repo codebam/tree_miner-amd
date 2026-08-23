@@ -236,6 +236,7 @@ pub fn rig_payload(snapshot: &StatsSnapshot, bind: &str, port: u16, ifaces: &dyn
         "delivery": {
             "network": snapshot.network_state.label(),
             "last_submission": snapshot.last_submission.label(),
+            "last_submission_age_seconds": snapshot.last_submission_age_seconds,
             "queued_xnm": snapshot.queued_xnm,
             "queued_xuni": snapshot.queued_xuni,
             "queued_total": snapshot.queued_xnm + snapshot.queued_xuni,

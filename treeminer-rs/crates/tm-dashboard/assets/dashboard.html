@@ -310,6 +310,13 @@
       const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
       return d ? `${d}d ${h}h` : h ? `${h}h ${m}m` : `${m}m`;
     };
+    // Matches format_age() on the miner side: s / m / h, rounded down.
+    const ago = (seconds) => {
+      const s = Math.max(0, Math.floor(Number(seconds)));
+      if (s < 60) return `${s}s`;
+      if (s < 3600) return `${Math.floor(s / 60)}m`;
+      return `${Math.floor(s / 3600)}h`;
+    };
     const escapeHtml = (value) => String(value).replace(/[&<>'"]/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
 
     // Rolling hashrate history, ~10 min at one sample per 2.5s poll.
@@ -384,7 +391,11 @@
       $('q-xuni').classList.toggle('warn', Number(delivery.queued_xuni || 0) > 0);
       text('uptime', duration(engine.uptime_seconds));
       text('delivery-network', delivery.network.toUpperCase());
-      text('last-submission', delivery.last_submission.toUpperCase());
+      // A bare "ACCEPTED" from an hour ago implies a healthy uplink; the age says otherwise.
+      const submissionAge = delivery.last_submission_age_seconds;
+      text('last-submission', submissionAge == null
+        ? delivery.last_submission.toUpperCase()
+        : `${delivery.last_submission.toUpperCase()} ${ago(submissionAge).toUpperCase()} AGO`);
       text('queue-total', `${compact(delivery.queued_total)} finds`);
       text('cpu-workers', `${engine.cpu_workers} workers`);
       text('stream-count', engine.cuda_streams);

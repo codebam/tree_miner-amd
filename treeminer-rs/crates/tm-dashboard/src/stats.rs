@@ -240,6 +240,10 @@ pub struct StatsSnapshot {
     pub failed_blocks: i64,
     pub network_state: NetworkState,
     pub last_submission: LastSubmissionState,
+    /// How long ago that outcome landed, `None` until something is submitted. Served as an
+    /// extra field rather than folded into `last_submission`, whose value shape third-party
+    /// pollers already read.
+    pub last_submission_age_seconds: Option<u64>,
     pub queued_xnm: u64,
     pub queued_xuni: u64,
     pub fatal_durability_failure: bool,

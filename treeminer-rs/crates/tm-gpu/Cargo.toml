@@ -15,3 +15,17 @@ tm-argon2 = { workspace = true }
 blake2 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[features]
+default = ["rust-kernel"]
+# The Argon2 device kernels written in Rust (`../tm-kernel`, compiled for amdgcn and loaded
+# with hipModuleLoad). This is the shipping path: it reproduces all 44 fixture vectors byte
+# for byte, agrees with the HIP kernel on raw block output, and runs ~1.5x faster because it
+# keeps the per-thread scratch in registers instead of round-tripping 1 KiB of LDS per
+# Argon2 block. See PORT.md.
+rust-kernel = []
+# Build the hipcc kernels too. They are the differential oracle every kernel test compares
+# against, so this stays on: dropping it would leave any future kernel change with nothing
+# to check itself against. It is also the fallback if the Rust toolchain path breaks —
+# `--no-default-features --features hip-kernel` restores the old behaviour.
+hip-kernel = []

@@ -439,6 +439,9 @@ fn build_submitter(
             if let Some(logger) = &logger {
                 let _ = logger.log(&message);
             }
+            let (level, console_message) =
+                outcome_console(classification, record.payload.kind, record.id, http_status, &detail);
+            Console::global().event(level, "UPLINK", &console_message);
         },
     ));
 
@@ -483,6 +486,40 @@ fn outcome_labels(classification: &tm_core::Classification) -> (&'static str, St
         Dead | PermanentlyInvalid => ("UPLINK REJECTED", classification.reason.clone()),
         _ => ("UPLINK UPDATED", classification.reason.clone()),
     }
+}
+
+/// Console rendering for a submission outcome.
+///
+/// The C++ wrote uplink outcomes to the log file only, so an operator watching the console
+/// saw every find appear and none of them get delivered — the one thing this miner exists to
+/// guarantee. The file line is kept verbatim for log parsers; this adds the on-screen half.
+fn outcome_console(
+    classification: &tm_core::Classification,
+    kind: tm_core::FindKind,
+    id: i64,
+    http_status: Option<i32>,
+    detail: &str,
+) -> (Level, String) {
+    use tm_core::FindStatus::*;
+    let (level, verb) = match classification.next_status {
+        Acked => (Level::Ok, "confirmed"),
+        AcceptedUnconfirmed => (Level::Info, "accepted"),
+        Pending => (Level::Retry, "retrying"),
+        ParkedDifficulty | ParkedXuniWindow => (Level::Park, "parked"),
+        Quarantined => (Level::Error, "quarantined"),
+        Dead | PermanentlyInvalid => (Level::Error, "rejected"),
+        _ => (Level::Info, "updated"),
+    };
+    let http = http_status
+        .map(|status| format!("  \u{2022}  HTTP={status}"))
+        .unwrap_or_default();
+    (
+        level,
+        format!(
+            "#{id}  \u{2022}  {}  \u{2022}  {verb}{http}  \u{2022}  {detail}",
+            kind.as_str()
+        ),
+    )
 }
 
 fn last_submission_for(status: tm_core::FindStatus) -> tm_dashboard::stats::LastSubmissionState {
@@ -861,4 +898,71 @@ fn finish(
     }
     println!();
     EXIT_OK
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tm_core::{Classification, FindKind, FindStatus};
+
+    fn classification(next_status: FindStatus, reason: &str) -> Classification {
+        Classification {
+            next_status,
+            server_difficulty_hint: None,
+            needs_lookup_confirmation: false,
+            reason: reason.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_confirmed_upload_reaches_the_console_as_an_ok_event() {
+        let (level, message) = outcome_console(
+            &classification(FindStatus::Acked, "server record verified"),
+            FindKind::Xen11,
+            376,
+            Some(200),
+            "server record verified",
+        );
+        assert_eq!(level, Level::Ok);
+        assert!(message.contains("#376"), "{message}");
+        assert!(message.contains("XEN11"), "{message}");
+        assert!(message.contains("confirmed"), "{message}");
+        assert!(message.contains("HTTP=200"), "{message}");
+    }
+
+    #[test]
+    fn every_outcome_has_a_console_level_matching_its_severity() {
+        let cases = [
+            (FindStatus::Acked, Level::Ok, "confirmed"),
+            (FindStatus::AcceptedUnconfirmed, Level::Info, "accepted"),
+            (FindStatus::Pending, Level::Retry, "retrying"),
+            (FindStatus::ParkedDifficulty, Level::Park, "parked"),
+            (FindStatus::ParkedXuniWindow, Level::Park, "parked"),
+            (FindStatus::Quarantined, Level::Error, "quarantined"),
+            (FindStatus::Dead, Level::Error, "rejected"),
+            (FindStatus::PermanentlyInvalid, Level::Error, "rejected"),
+        ];
+        for (status, expected_level, expected_verb) in cases {
+            let (level, message) = outcome_console(
+                &classification(status, "reason"),
+                FindKind::Xuni,
+                7,
+                None,
+                "reason",
+            );
+            assert_eq!(level, expected_level, "{status:?}");
+            assert!(message.contains(expected_verb), "{status:?}: {message}");
+            assert!(!message.contains("HTTP="), "no status means no HTTP segment");
+        }
+    }
+
+    /// The log file is what operators grep after the fact; its wording must not drift.
+    #[test]
+    fn the_log_line_labels_stay_as_the_cpp_wrote_them() {
+        let (label, detail) = outcome_labels(&classification(FindStatus::Acked, "ignored"));
+        assert_eq!(label, "UPLINK CONFIRMED");
+        assert_eq!(detail, "server record verified");
+        let (label, _) = outcome_labels(&classification(FindStatus::ParkedXuniWindow, "window"));
+        assert_eq!(label, "UPLINK PARKED");
+    }
 }

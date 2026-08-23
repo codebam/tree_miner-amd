@@ -28,6 +28,8 @@ pub mod device;
 pub mod error;
 mod hip;
 pub mod hash;
+#[cfg(feature = "rust-kernel")]
+mod module;
 pub mod params;
 pub mod runner;
 pub mod telemetry;

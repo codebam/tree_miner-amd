@@ -1,0 +1,19 @@
+[package]
+name = "tm-kernel"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+# Not a workspace member: this crate is only ever compiled for `amdgcn-amd-amdhsa` by
+# tm-gpu's build.rs (see PORT.md, "Rust GPU kernels"). Building it for the host would fail —
+# it is `#![no_std]` with a GPU-only ABI — so the workspace root excludes it.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+debug = false
+panic = "abort"

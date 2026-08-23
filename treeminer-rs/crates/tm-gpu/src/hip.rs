@@ -9,6 +9,8 @@
 
 #![allow(non_camel_case_types)]
 
+#[cfg(feature = "rust-kernel")]
+use std::ffi::c_uint;
 use std::ffi::{c_char, c_int, c_void, CStr};
 
 use crate::error::{GpuError, Result};
@@ -16,16 +18,31 @@ use crate::error::{GpuError, Result};
 pub type hipError_t = c_int;
 pub type hipStream_t = *mut c_void;
 pub type hipEvent_t = *mut c_void;
+#[cfg(feature = "rust-kernel")]
+pub type hipModule_t = *mut c_void;
+#[cfg(feature = "rust-kernel")]
+pub type hipFunction_t = *mut c_void;
 
 pub const HIP_SUCCESS: hipError_t = 0;
 
 pub const HIP_MEMCPY_HOST_TO_DEVICE: c_int = 1;
 pub const HIP_MEMCPY_DEVICE_TO_HOST: c_int = 2;
 
+/// The sentinels `hipModuleLaunchKernel` reads its `extra` list with. HIP defines them as
+/// literal small integers cast to pointers, not as addresses (hip_runtime_api.h).
+#[cfg(feature = "rust-kernel")]
+pub const HIP_LAUNCH_PARAM_BUFFER_POINTER: *mut c_void = std::ptr::without_provenance_mut(0x01);
+#[cfg(feature = "rust-kernel")]
+pub const HIP_LAUNCH_PARAM_BUFFER_SIZE: *mut c_void = std::ptr::without_provenance_mut(0x02);
+#[cfg(feature = "rust-kernel")]
+pub const HIP_LAUNCH_PARAM_END: *mut c_void = std::ptr::without_provenance_mut(0x03);
+
 extern "C" {
     fn hipGetErrorString(error: hipError_t) -> *const c_char;
 
     fn hipGetDeviceCount(count: *mut c_int) -> hipError_t;
+    #[cfg(feature = "rust-kernel")]
+    fn hipGetDevice(device: *mut c_int) -> hipError_t;
     fn hipSetDevice(device: c_int) -> hipError_t;
     fn hipDeviceGetName(name: *mut c_char, len: c_int, device: c_int) -> hipError_t;
     fn hipDeviceGetPCIBusId(pci_bus_id: *mut c_char, len: c_int, device: c_int) -> hipError_t;
@@ -54,6 +71,41 @@ extern "C" {
     fn hipEventDestroy(event: hipEvent_t) -> hipError_t;
     fn hipEventRecord(event: hipEvent_t, stream: hipStream_t) -> hipError_t;
     fn hipEventElapsedTime(ms: *mut f32, start: hipEvent_t, end: hipEvent_t) -> hipError_t;
+}
+
+// The module API, used only to load the Rust-compiled kernels (`src/module.rs`).
+#[cfg(feature = "rust-kernel")]
+extern "C" {
+    pub fn hipModuleLoadData(module: *mut hipModule_t, image: *const c_void) -> hipError_t;
+    pub fn hipModuleGetFunction(
+        function: *mut hipFunction_t,
+        module: hipModule_t,
+        name: *const c_char,
+    ) -> hipError_t;
+    #[allow(clippy::too_many_arguments)]
+    pub fn hipModuleLaunchKernel(
+        function: hipFunction_t,
+        grid_dim_x: c_uint,
+        grid_dim_y: c_uint,
+        grid_dim_z: c_uint,
+        block_dim_x: c_uint,
+        block_dim_y: c_uint,
+        block_dim_z: c_uint,
+        shared_mem_bytes: c_uint,
+        stream: hipStream_t,
+        kernel_params: *mut *mut c_void,
+        extra: *mut *mut c_void,
+    ) -> hipError_t;
+}
+
+/// The device currently active on this thread. Modules are loaded per device, so the
+/// module cache needs this as its key.
+#[cfg(feature = "rust-kernel")]
+pub fn current_device() -> Result<i32> {
+    let mut device: c_int = 0;
+    // SAFETY: `device` is a live, aligned i32 for the duration of the call.
+    check("hipGetDevice", unsafe { hipGetDevice(&mut device) })?;
+    Ok(device)
 }
 
 /// Turns a `hipError_t` into a `Result`, attaching the driver's own message.
@@ -316,6 +368,7 @@ impl Drop for Event {
 
 /// Bindings to the two kernel entry points in `kernel/argon2_kernel.hip`.
 #[cfg(not(tm_gpu_stub))]
+#[allow(dead_code)]
 mod kernel {
     use super::{hipError_t, hipStream_t};
     use std::ffi::{c_uint, c_void};
@@ -350,11 +403,38 @@ mod kernel {
 
 /// Launches the one-shot Argon2 kernel.
 ///
+/// With the `rust-kernel` feature this dispatches to the Rust kernel in `tm-kernel`; with
+/// the feature off — the default — it is the hipcc-compiled one.
+///
 /// # Safety
 /// `memory` must point to at least `batch_size * segment_blocks * 4 * 1024` device bytes
 /// whose first two blocks per job are already filled, and must stay alive until `stream`
 /// is synchronised.
 pub unsafe fn launch_oneshot(
+    stream: &Stream,
+    memory: *mut c_void,
+    segment_blocks: u32,
+    batch_size: usize,
+) -> Result<()> {
+    #[cfg(feature = "rust-kernel")]
+    {
+        crate::module::launch_oneshot(stream, memory, segment_blocks, batch_size)
+    }
+    #[cfg(not(feature = "rust-kernel"))]
+    {
+        launch_oneshot_hip(stream, memory, segment_blocks, batch_size)
+    }
+}
+
+/// The hipcc-compiled one-shot kernel, reachable directly so that the differential test can
+/// run it against the Rust one inside a single process and a single device pool.
+///
+/// # Safety
+/// As for [`launch_oneshot`].
+// With the feature on, the only caller is that test; the compiler cannot see it in a
+// non-test build, but removing it would remove the fallback the feature exists to keep.
+#[allow(dead_code)]
+pub unsafe fn launch_oneshot_hip(
     stream: &Stream,
     memory: *mut c_void,
     segment_blocks: u32,
@@ -374,12 +454,81 @@ pub unsafe fn launch_oneshot(
 
 /// Launches the device-side first-blocks kernel.
 ///
+/// With the `rust-kernel` feature this dispatches to the Rust kernel in `tm-kernel`; with
+/// the feature off — the default — it is the hipcc-compiled one. Nothing else about the
+/// batch changes, which is what makes the fallback a single flag.
+///
 /// # Safety
 /// `memory` must be the pool described above, `keys` must hold `batch_size * key_length`
 /// bytes and `salt` `salt_length` bytes, all on the device and alive until `stream` is
 /// synchronised.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn launch_first_blocks(
+    stream: &Stream,
+    memory: *mut c_void,
+    keys: *const c_void,
+    key_length: u32,
+    salt: *const c_void,
+    salt_length: u32,
+    output_length: u32,
+    memory_cost: u32,
+    time_cost: u32,
+    version: u32,
+    type_: u32,
+    lanes: u32,
+    segment_blocks: u32,
+    batch_size: usize,
+) -> Result<()> {
+    #[cfg(feature = "rust-kernel")]
+    {
+        crate::module::launch_first_blocks(
+            stream,
+            memory,
+            keys,
+            key_length,
+            salt,
+            salt_length,
+            output_length,
+            memory_cost,
+            time_cost,
+            version,
+            type_,
+            lanes,
+            segment_blocks,
+            batch_size,
+        )
+    }
+    #[cfg(not(feature = "rust-kernel"))]
+    {
+        launch_first_blocks_hip(
+            stream,
+            memory,
+            keys,
+            key_length,
+            salt,
+            salt_length,
+            output_length,
+            memory_cost,
+            time_cost,
+            version,
+            type_,
+            lanes,
+            segment_blocks,
+            batch_size,
+        )
+    }
+}
+
+/// The hipcc-compiled first-blocks kernel, reachable directly so that the differential test
+/// can run it against the Rust one inside a single process and a single device pool.
+///
+/// # Safety
+/// As for [`launch_first_blocks`].
+// With the feature on, the only caller is that test; the compiler cannot see it in a
+// non-test build, but removing it would remove the fallback the feature exists to keep.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn launch_first_blocks_hip(
     stream: &Stream,
     memory: *mut c_void,
     keys: *const c_void,

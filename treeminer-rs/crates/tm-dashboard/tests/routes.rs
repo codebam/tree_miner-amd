@@ -73,6 +73,7 @@ fn full_snapshot() -> StatsSnapshot {
         failed_blocks: 1,
         network_state: NetworkState::Open,
         last_submission: LastSubmissionState::Retry,
+        last_submission_age_seconds: Some(245),
         queued_xnm: 3,
         queued_xuni: 2,
         fatal_durability_failure: false,
@@ -368,6 +369,7 @@ async fn rig_serves_what_the_embedded_page_reads() {
 
     assert_eq!(body["delivery"]["network"], "offline");
     assert_eq!(body["delivery"]["last_submission"], "retrying");
+    assert_eq!(body["delivery"]["last_submission_age_seconds"], 245);
     assert_eq!(body["delivery"]["queued_xnm"], 3);
     assert_eq!(body["delivery"]["queued_xuni"], 2);
     assert_eq!(body["delivery"]["queued_total"], 5);
@@ -418,6 +420,11 @@ async fn a_rig_with_no_gpus_still_renders_valid_json() {
     assert_eq!(rig["identity"]["name"], "TreeMiner");
     assert_eq!(rig["delivery"]["network"], "online");
     assert_eq!(rig["delivery"]["last_submission"], "none");
+    // Nothing submitted yet is a null age, not a zero one: zero would read as "just now".
+    assert!(
+        rig["delivery"]["last_submission_age_seconds"].is_null(),
+        "age is null until something is submitted"
+    );
 
     let stats = harness.json("/stats").await;
     assert_eq!(stats["gpus"], serde_json::json!([]));

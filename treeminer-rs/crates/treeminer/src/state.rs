@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use parking_lot::{Mutex, RwLock};
 use tm_dashboard::stats::{GpuStat, GpuTelemetry, LastSubmissionState, NetworkState};
@@ -37,7 +37,9 @@ pub struct MiningState {
 
     queued_xnm: AtomicU64,
     queued_xuni: AtomicU64,
-    last_submission: Mutex<LastSubmissionState>,
+    /// The outcome and when it landed. One cell, so a reader can never pair a fresh state
+    /// with a stale age.
+    last_submission: Mutex<(LastSubmissionState, Option<Instant>)>,
     network_state: Mutex<NetworkState>,
 
     cpu_workers: AtomicU64,
@@ -72,7 +74,7 @@ impl MiningState {
             hash_count: AtomicU64::new(0),
             queued_xnm: AtomicU64::new(0),
             queued_xuni: AtomicU64::new(0),
-            last_submission: Mutex::new(LastSubmissionState::None),
+            last_submission: Mutex::new((LastSubmissionState::None, None)),
             network_state: Mutex::new(NetworkState::Closed),
             cpu_workers: AtomicU64::new(0),
             cpu_hashrate_bits: AtomicU64::new(0),
@@ -126,6 +128,11 @@ impl MiningState {
 
     pub fn difficulty_endpoint_down(&self) -> bool {
         self.difficulty.endpoint_down()
+    }
+
+    #[cfg(test)]
+    pub fn set_difficulty_endpoint_down(&self, down: bool) {
+        self.difficulty.set_endpoint_down(down);
     }
 
     pub fn margin_kib(&self) -> u32 {
@@ -195,11 +202,29 @@ impl MiningState {
     }
 
     pub fn set_last_submission(&self, state: LastSubmissionState) {
-        *self.last_submission.lock() = state;
+        // `None` is "nothing submitted this session", which has no age to report.
+        let at = (state != LastSubmissionState::None).then(Instant::now);
+        *self.last_submission.lock() = (state, at);
     }
 
     pub fn last_submission(&self) -> LastSubmissionState {
-        *self.last_submission.lock()
+        self.last_submission.lock().0
+    }
+
+    /// How long ago the last submission outcome landed; `None` until one does. A bare
+    /// "accepted" from an hour ago reads as a healthy uplink, so the surfaces show the age.
+    pub fn last_submission_age(&self) -> Option<Duration> {
+        self.last_submission.lock().1.map(|at| at.elapsed())
+    }
+
+    /// Pushes the recorded submission instant back, so tests can render an aged label
+    /// without waiting.
+    #[cfg(test)]
+    pub fn backdate_last_submission(&self, by: Duration) {
+        let mut cell = self.last_submission.lock();
+        if let Some(at) = cell.1 {
+            cell.1 = at.checked_sub(by);
+        }
     }
 
     pub fn set_network_state(&self, state: NetworkState) {

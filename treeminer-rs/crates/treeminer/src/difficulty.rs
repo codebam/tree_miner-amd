@@ -73,6 +73,12 @@ impl DifficultyShared {
     pub fn endpoint_down(&self) -> bool {
         self.endpoint_down.load(Ordering::Acquire)
     }
+
+    /// Only the poller flips this in a running miner; tests use it to stage an outage.
+    #[cfg(test)]
+    pub(crate) fn set_endpoint_down(&self, down: bool) {
+        self.endpoint_down.store(down, Ordering::Release);
+    }
 }
 
 /// What one poll did, so callers (and tests) can assert on it without reading the log.

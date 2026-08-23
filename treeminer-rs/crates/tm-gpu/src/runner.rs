@@ -380,3 +380,279 @@ impl KernelRunner {
         self.timings
     }
 }
+
+/// The Rust kernels and the HIP kernels must produce identical blocks, byte for byte.
+///
+/// This lives inside the crate, not in `tests/`, because it has to reach both launch paths
+/// at once — the public API only exposes whichever one the feature selected. Comparing raw
+/// blocks rather than the final digest is deliberate: two compensating bugs can still agree
+/// on a digest, but they cannot agree on a kilobyte of Argon2 output.
+#[cfg(all(test, feature = "rust-kernel"))]
+mod kernel_differential {
+    use super::*;
+    use crate::device::Device;
+
+    /// Both launch functions have this exact signature, which is what lets the test swap
+    /// one for the other without touching anything else about the batch.
+    #[allow(clippy::type_complexity)]
+    type Launch = unsafe fn(
+        &Stream,
+        *mut c_void,
+        *const c_void,
+        u32,
+        *const c_void,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        u32,
+        usize,
+    ) -> Result<()>;
+
+    /// The same for the one-shot pair.
+    type LaunchOneshot = unsafe fn(&Stream, *mut c_void, u32, usize) -> Result<()>;
+
+    /// Which implementation to launch. Both take exactly the same arguments.
+    #[derive(Clone, Copy, Debug)]
+    enum Which {
+        Hip,
+        Rust,
+    }
+
+    impl KernelRunner {
+        /// Runs the queued device first-blocks launch with a chosen implementation and
+        /// reads the resulting 2 KiB block pair of every job back.
+        fn first_blocks_with(&mut self, which: Which) -> Result<Vec<u8>> {
+            let config = self
+                .pending_first_blocks
+                .ok_or_else(|| GpuError::Invalid("no first blocks prepared".to_owned()))?;
+            let keys = self
+                .device_keys
+                .as_ref()
+                .ok_or_else(|| GpuError::Invalid("no keys staged".to_owned()))?;
+            let salt = self
+                .device_salt
+                .as_ref()
+                .ok_or_else(|| GpuError::Invalid("no salt staged".to_owned()))?;
+
+            // SAFETY: identical to the production launch — the pool, keys and salt were all
+            // sized by `prepare_input_blocks_on_device` and outlive the stream, which is
+            // synchronised below before anything is read.
+            unsafe {
+                let launch: Launch = match which {
+                    Which::Hip => hip::launch_first_blocks_hip,
+                    Which::Rust => hip::launch_first_blocks,
+                };
+                launch(
+                    &self.stream,
+                    self.memory.as_ptr(),
+                    keys.as_ptr(),
+                    config.key_length,
+                    salt.as_ptr(),
+                    config.salt_length,
+                    config.shape.output_length,
+                    config.shape.memory_cost,
+                    config.shape.passes,
+                    config.shape.version,
+                    config.shape.type_,
+                    config.shape.lanes,
+                    self.shape.segment_blocks(),
+                    self.batch_size,
+                )?;
+            }
+
+            let row = INPUT_BLOCKS_PER_JOB * ARGON2_BLOCK_SIZE;
+            let mut blocks = vec![0u8; self.batch_size * row];
+            // SAFETY: the first two blocks of every job lie at the start of that job's
+            // stride, so `batch_size` rows of `row` bytes at pitch `job_bytes()` are inside
+            // the pool; `blocks` is exactly that size and is read only after the sync.
+            unsafe {
+                hip::memcpy_2d_async(
+                    blocks.as_mut_ptr().cast::<c_void>(),
+                    row,
+                    self.memory.as_ptr().cast_const(),
+                    self.job_bytes(),
+                    row,
+                    self.batch_size,
+                    HIP_MEMCPY_DEVICE_TO_HOST,
+                    self.stream.raw(),
+                )?;
+            }
+            self.stream.synchronize()?;
+            Ok(blocks)
+        }
+    }
+
+    #[test]
+    fn the_rust_and_hip_first_blocks_kernels_agree_byte_for_byte() {
+        let Ok(devices) = Device::enumerate() else {
+            eprintln!("skipping the differential test: GPU unavailable");
+            return;
+        };
+        let Some(device) = devices.into_iter().next() else {
+            eprintln!("skipping the differential test: no GPU present");
+            return;
+        };
+        device.activate().expect("the device activates");
+
+        // The card is shared with whatever else is mining on this box, so the batches stay
+        // small and the difficulties modest.
+        let passwords: Vec<String> = (0..4)
+            .map(|index| format!("{index:064x}"))
+            .collect();
+        let salt = hex_bytes("e4bb184781bbc9c7004e8dafd4a9b49d203bc9bc");
+
+        let mut compared = 0;
+        for difficulty in [8u32, 100, 1777, 60000] {
+            for batch_size in [1usize, 4] {
+                let shape = Argon2Shape::for_difficulty(difficulty);
+                let mut runner =
+                    KernelRunner::new(shape, batch_size).expect("the pool allocates");
+                let batch = &passwords[..batch_size];
+                assert!(
+                    runner
+                        .prepare_input_blocks_on_device(batch, &salt, &shape)
+                        .expect("staging succeeds"),
+                    "m={difficulty} batch={batch_size}: the kernel should accept this shape"
+                );
+
+                let hip_blocks = runner
+                    .first_blocks_with(Which::Hip)
+                    .expect("the HIP kernel runs");
+                let rust_blocks = runner
+                    .first_blocks_with(Which::Rust)
+                    .expect("the Rust kernel runs");
+
+                assert_ne!(
+                    hip_blocks,
+                    vec![0u8; hip_blocks.len()],
+                    "m={difficulty} batch={batch_size}: the HIP kernel wrote nothing, so an \
+                     equality check would be vacuous"
+                );
+                // Reported as the first differing byte rather than as two 2 KiB arrays: the
+                // offset says which of the two blocks, and which H' iteration inside it,
+                // went wrong.
+                let divergence = hip_blocks
+                    .iter()
+                    .zip(&rust_blocks)
+                    .position(|(hip, rust)| hip != rust);
+                assert!(
+                    divergence.is_none(),
+                    "m={difficulty} batch={batch_size}: the Rust first-blocks kernel diverged \
+                     from the HIP one at byte {} of {} (job {}, block {})",
+                    divergence.unwrap_or_default(),
+                    hip_blocks.len(),
+                    divergence.unwrap_or_default() / (INPUT_BLOCKS_PER_JOB * ARGON2_BLOCK_SIZE),
+                    divergence.unwrap_or_default() % (INPUT_BLOCKS_PER_JOB * ARGON2_BLOCK_SIZE)
+                        / ARGON2_BLOCK_SIZE
+                );
+                compared += batch_size;
+            }
+        }
+        eprintln!("compared {compared} first-block pairs across both kernels");
+    }
+
+    impl KernelRunner {
+        /// Runs the one-shot kernel with a chosen implementation and reads back the final
+        /// 1 KiB block of every job — the block the digest is derived from.
+        ///
+        /// The first two blocks of each job are left untouched by either kernel (both write
+        /// only blocks `2..lane_blocks`), so the same staged pool can serve both runs.
+        fn oneshot_with(&mut self, which: Which) -> Result<Vec<u8>> {
+            // SAFETY: the pool holds `batch_size` jobs of `4 * segment_blocks` blocks and
+            // outlives the stream, and the caller staged every job's first two blocks.
+            unsafe {
+                let launch: LaunchOneshot = match which {
+                    Which::Hip => hip::launch_oneshot_hip,
+                    Which::Rust => hip::launch_oneshot,
+                };
+                launch(
+                    &self.stream,
+                    self.memory.as_ptr(),
+                    self.shape.segment_blocks(),
+                    self.batch_size,
+                )?;
+            }
+            self.copy_output_blocks()?;
+            self.stream.synchronize()?;
+            Ok(self.blocks_out.clone())
+        }
+    }
+
+    #[test]
+    fn the_rust_and_hip_oneshot_kernels_agree_byte_for_byte() {
+        let Ok(devices) = Device::enumerate() else {
+            eprintln!("skipping the differential test: GPU unavailable");
+            return;
+        };
+        let Some(device) = devices.into_iter().next() else {
+            eprintln!("skipping the differential test: no GPU present");
+            return;
+        };
+        device.activate().expect("the device activates");
+
+        let passwords: Vec<String> = (0..4).map(|index| format!("{index:064x}")).collect();
+        let salt = hex_bytes("e4bb184781bbc9c7004e8dafd4a9b49d203bc9bc");
+
+        let mut compared = 0;
+        // The difficulties straddle every shape the kernel branches on: `segment_blocks`
+        // below the 128-offset address-block refresh, above it, and at production sizes.
+        for difficulty in [8u32, 100, 1777, 42069, 60000] {
+            for batch_size in [1usize, 4] {
+                let shape = Argon2Shape::for_difficulty(difficulty);
+                let mut runner =
+                    KernelRunner::new(shape, batch_size).expect("the pool allocates");
+                let batch = &passwords[..batch_size];
+                assert!(
+                    runner
+                        .prepare_input_blocks_on_device(batch, &salt, &shape)
+                        .expect("staging succeeds"),
+                    "m={difficulty} batch={batch_size}: the kernel should accept this shape"
+                );
+                runner
+                    .first_blocks_with(Which::Hip)
+                    .expect("the HIP first-blocks kernel runs");
+
+                let hip_final = runner
+                    .oneshot_with(Which::Hip)
+                    .expect("the HIP one-shot kernel runs");
+                let rust_final = runner
+                    .oneshot_with(Which::Rust)
+                    .expect("the Rust one-shot kernel runs");
+
+                assert_ne!(
+                    hip_final,
+                    vec![0u8; hip_final.len()],
+                    "m={difficulty} batch={batch_size}: the HIP kernel wrote nothing, so an \
+                     equality check would be vacuous"
+                );
+                let divergence = hip_final
+                    .iter()
+                    .zip(&rust_final)
+                    .position(|(hip, rust)| hip != rust);
+                assert!(
+                    divergence.is_none(),
+                    "m={difficulty} batch={batch_size}: the Rust one-shot kernel diverged from \
+                     the HIP one at byte {} of {} (job {})",
+                    divergence.unwrap_or_default(),
+                    hip_final.len(),
+                    divergence.unwrap_or_default() / ARGON2_BLOCK_SIZE
+                );
+                compared += batch_size;
+            }
+        }
+        eprintln!("compared {compared} final blocks across both one-shot kernels");
+    }
+
+    fn hex_bytes(text: &str) -> Vec<u8> {
+        (0..text.len() / 2)
+            .map(|index| {
+                u8::from_str_radix(&text[2 * index..2 * index + 2], 16)
+                    .expect("the literal is valid hex")
+            })
+            .collect()
+    }
+}
