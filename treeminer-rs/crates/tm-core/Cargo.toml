@@ -1,0 +1,14 @@
+[package]
+name = "tm-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Shared TreeMiner contract: find lifecycle types, PHC assembly, matching rules, batch sizing"
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+hex = { workspace = true }
+sha3 = { workspace = true }

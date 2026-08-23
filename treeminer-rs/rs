@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Toolchain wrapper: this box has no global rust/hip, both come from nix.
+# Usage: ./rs cargo test -p tm-core
+set -euo pipefail
+CLR=/nix/store/95lwwwfb3alzn7pk9ky55fbbflaxarb5-clr-7.2.3
+DEVLIBS=/nix/store/8jdkas7zs4yzqs0n3xrrnnmc9s3xx5zb-rocm-device-libs-22.0.0-rocm
+SMI=/nix/store/bz2lfkmiydg5h8l70w1r3959kv7c7vpr-rocm-smi-7.2.3
+export ROCM_PATH="$CLR" HIP_PATH="$CLR"
+export HIP_DEVICE_LIB_PATH="$DEVLIBS/amdgcn/bitcode"
+export TM_ROCM_SMI_PATH="$SMI"
+export PATH="$CLR/bin:$PATH"
+exec nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#clippy nixpkgs#rustfmt nixpkgs#gcc nixpkgs#pkg-config nixpkgs#openssl --command "$@"

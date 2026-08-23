@@ -1,0 +1,16 @@
+[package]
+name = "tm-argon2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+tm-core = { workspace = true }
+argon2 = { workspace = true }
+blake2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rand = { workspace = true }

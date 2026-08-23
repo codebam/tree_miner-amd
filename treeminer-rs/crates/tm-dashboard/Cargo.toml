@@ -1,0 +1,18 @@
+[package]
+name = "tm-dashboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+axum = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["fs", "rt-multi-thread", "macros"] }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }

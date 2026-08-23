@@ -1,0 +1,39 @@
+[package]
+name = "treeminer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "treeminer"
+path = "src/lib.rs"
+
+[[bin]]
+name = "treeminer"
+path = "src/main.rs"
+
+[dependencies]
+tm-core = { workspace = true }
+tm-argon2 = { workspace = true }
+tm-gpu = { workspace = true }
+tm-journal = { workspace = true }
+tm-submit = { workspace = true }
+tm-dashboard = { workspace = true }
+tm-tui = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true, features = ["signal"] }
+rand = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+parking_lot = { workspace = true }
+reqwest = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

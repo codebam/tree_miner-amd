@@ -1,0 +1,19 @@
+[package]
+name = "tm-submit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Outage-proof submission: durable-journal drain, circuit breaker, response truth table"
+
+[dependencies]
+tm-core = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
