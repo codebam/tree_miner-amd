@@ -60,6 +60,15 @@ impl Capture {
 /// instead of waiting out an idle poll.
 pub type FindNotifier = Arc<dyn Fn() + Send + Sync>;
 
+/// Called after a find reaches durable storage — journal OR fallback sink — with the
+/// payload as it will be submitted.
+///
+/// Platform mode reports finds to the broker through this. STRICTLY after durable capture,
+/// and never for a find that reached neither path: MQTT can block or race shutdown, and
+/// advertising a block the disk never received has the platform (and its consumer)
+/// accounting for value that no longer exists.
+pub type FindObserver = Arc<dyn Fn(&Find, &FoundPayload) + Send + Sync>;
+
 /// The journal-first sink every producer (GPU loop, CPU sidecar) hands its finds to.
 pub struct FindSink {
     journal: Arc<dyn Journal + Send + Sync>,
@@ -68,6 +77,7 @@ pub struct FindSink {
     machine_id: String,
     logger: Option<Arc<FileLogger>>,
     notifier: Option<FindNotifier>,
+    observer: Option<FindObserver>,
     /// Injected so tests do not depend on the wall clock.
     now_utc: Box<dyn Fn() -> String + Send + Sync>,
 }
@@ -95,6 +105,7 @@ impl FindSink {
             machine_id: machine_id.into(),
             logger: None,
             notifier: None,
+            observer: None,
             now_utc: Box::new(|| {
                 tm_submit::iso_utc(tm_submit::clocktime::now_wall_ms())
             }),
@@ -108,6 +119,11 @@ impl FindSink {
 
     pub fn with_notifier(mut self, notifier: FindNotifier) -> Self {
         self.notifier = Some(notifier);
+        self
+    }
+
+    pub fn with_observer(mut self, observer: FindObserver) -> Self {
+        self.observer = Some(observer);
         self
     }
 
@@ -157,6 +173,11 @@ impl FindSink {
         self.account(find, &payload, capture);
         if let (Capture::Journaled(_), Some(notifier)) = (capture, &self.notifier) {
             notifier();
+        }
+        // Journal or fallback both count as durable — the sink is imported back on the next
+        // boot — but `Lost` does not, and must not be reported anywhere.
+        if let (true, Some(observer)) = (capture.is_durable(), &self.observer) {
+            observer(find, &payload);
         }
         capture
     }

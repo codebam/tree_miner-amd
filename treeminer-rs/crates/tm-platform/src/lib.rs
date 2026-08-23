@@ -13,8 +13,9 @@
 //! every command carries an HMAC-SHA256 envelope ([`envelope`]) bound to this worker's id,
 //! with a bounded lifetime and a single-use nonce; the signature is checked before the
 //! command is even interpreted; and when no secret is configured, the miner still refuses
-//! every command that could move money. Nothing parsed from the network can panic, and
-//! nothing is applied partially.
+//! every command that could move money — including `assign_task`, whose `consumer_address`
+//! redirects every block found for the length of the lease. Nothing parsed from the network
+//! can panic, and nothing is applied partially.
 //!
 //! # Secrets
 //!

@@ -13,6 +13,8 @@ rule: absence of credentials must never fall through an authorization check.
   - default API bind is loopback
 """
 
+import json
+import logging
 import sys
 from pathlib import Path
 
@@ -27,6 +29,11 @@ from server.auth import DEFAULT_ADMIN_KEY
 from server.server import PlatformServer
 
 ADMIN = {"X-API-Key": DEFAULT_ADMIN_KEY}
+
+# The miner only accepts full EIP-55 checksummed addresses, so the platform
+# rejects anything else at the /api/rent boundary.
+CHECKSUMMED_ADDRESS = "0x8ba1f109551bD432803012645Ac136ddd64DBA72"
+LOWERCASE_ADDRESS = CHECKSUMMED_ADDRESS.lower()
 
 
 @pytest.fixture()
@@ -206,7 +213,11 @@ def test_authenticated_consumer_passes_rent_auth_gate(client):
     # With no workers registered the domain answer is 404 — the point is
     # that a valid consumer is not blocked by the auth layer (401/403).
     key = {"X-API-Key": register(client, "c-rent", "consumer")["api_key"]}
-    resp = client.post("/api/rent", json={"duration_sec": 60}, headers=key)
+    resp = client.post(
+        "/api/rent",
+        json={"duration_sec": 60, "consumer_address": CHECKSUMMED_ADDRESS},
+        headers=key,
+    )
     assert resp.status_code == 404
     assert "No available workers" in resp.text
 
@@ -233,3 +244,141 @@ def test_public_dashboard_reads_stay_open(client):
 def test_default_api_bind_is_loopback(tmp_path):
     server = PlatformServer(enable_chain=False, db_path=str(tmp_path / "bind.db"))
     assert server.api_host == "127.0.0.1"
+
+
+# ── Signed commands over the REST surface ──────────────────────────────────
+#
+# Every platform->worker command the API can trigger must leave the server with
+# a valid `auth` envelope, and must not leave at all when no shared secret is
+# configured. See server/command_signing.py for the contract.
+
+import server.command_signing as cs  # noqa: E402
+from server.command_signing import verify_signature  # noqa: E402
+# Value the autouse `platform_command_secret` fixture in conftest.py installs.
+TEST_COMMAND_SECRET = "unit-test-command-secret"
+
+
+@pytest.fixture()
+def recorded(client):
+    """Capture what the server would put on the wire, past the signing gate."""
+    srv = client.app.state.server
+    sent = []
+    original = srv.broker._publish_raw
+
+    async def _capture(topic, payload, qos=1):
+        sent.append((topic, payload, qos))
+        return await original(topic, payload, qos)
+
+    srv.broker._publish_raw = _capture
+    yield sent
+    srv.broker._publish_raw = original
+
+
+def test_control_command_is_signed(client, recorded):
+    resp = client.post("/api/workers/rig-01/control",
+                       json={"action": "pause"}, headers=ADMIN)
+    assert resp.status_code == 200
+    topic, payload, _ = recorded[0]
+    assert topic == "xenminer/rig-01/control"
+    assert verify_signature(payload, TEST_COMMAND_SECRET, "rig-01")
+
+
+def test_control_pause_carries_no_config_key(client, recorded):
+    """proto/platform_to_worker.json types control as additionalProperties:false."""
+    for action in ("pause", "resume", "shutdown"):
+        recorded.clear()
+        resp = client.post("/api/workers/rig-01/control",
+                           json={"action": action}, headers=ADMIN)
+        assert resp.status_code == 200, resp.text
+        _, payload, _ = recorded[0]
+        assert set(payload) == {"action", "auth"}, payload
+        assert payload["action"] == action
+
+
+def test_set_config_still_carries_its_config(client, recorded):
+    resp = client.post("/api/workers/rig-01/control",
+                       json={"action": "set_config", "config": {"difficulty": 8}},
+                       headers=ADMIN)
+    assert resp.status_code == 200
+    _, payload, _ = recorded[0]
+    assert payload["config"] == {"difficulty": 8}
+    assert verify_signature(payload, TEST_COMMAND_SECRET, "rig-01")
+
+
+def test_config_alongside_pause_is_rejected(client):
+    resp = client.post("/api/workers/rig-01/control",
+                       json={"action": "pause", "config": {"difficulty": 8}},
+                       headers=ADMIN)
+    assert resp.status_code == 400
+    assert "set_config" in resp.text
+
+
+def test_unknown_control_action_is_rejected(client):
+    resp = client.post("/api/workers/rig-01/control",
+                       json={"action": "self_destruct"}, headers=ADMIN)
+    assert resp.status_code == 400
+
+
+def test_control_refuses_to_publish_without_a_secret(client, recorded, monkeypatch):
+    monkeypatch.delenv(cs.SECRET_ENV_VAR, raising=False)
+    resp = client.post("/api/workers/rig-01/control",
+                       json={"action": "pause"}, headers=ADMIN)
+    assert resp.status_code == 503
+    assert cs.SECRET_ENV_VAR in resp.text
+    assert recorded == [], "an unsigned command must never reach the wire"
+
+
+def test_broadcast_refuses_to_publish_without_a_secret(client, recorded, monkeypatch):
+    monkeypatch.delenv(cs.SECRET_ENV_VAR, raising=False)
+    resp = client.post("/api/control/broadcast",
+                       json={"action": "pause"}, headers=ADMIN)
+    assert resp.status_code == 503
+    assert recorded == []
+
+
+def test_secret_never_appears_in_a_response(client, recorded):
+    for path, body in (
+        ("/api/workers/rig-01/control", {"action": "pause"}),
+        ("/api/control/broadcast", {"action": "pause"}),
+    ):
+        resp = client.post(path, json=body, headers=ADMIN)
+        assert TEST_COMMAND_SECRET not in resp.text
+    # Nor in the signed payload itself, only the digest derived from it.
+    for _, payload, _ in recorded:
+        assert TEST_COMMAND_SECRET not in json.dumps(payload)
+
+
+def test_secret_never_appears_in_logs(client, recorded, caplog):
+    with caplog.at_level(logging.DEBUG):
+        client.post("/api/workers/rig-01/control",
+                    json={"action": "set_config", "config": {"difficulty": 8}},
+                    headers=ADMIN)
+    assert TEST_COMMAND_SECRET not in caplog.text
+
+
+def test_command_nonces_are_unique_across_requests(client, recorded):
+    for _ in range(10):
+        client.post("/api/workers/rig-01/control",
+                    json={"action": "pause"}, headers=ADMIN)
+    nonces = [p["auth"]["nonce"] for _, p, _ in recorded]
+    assert len(nonces) == 10 and len(set(nonces)) == 10
+
+
+# ── consumer_address must be EIP-55, the way the miner requires ────────────
+
+
+def test_rent_rejects_a_lowercase_consumer_address(client):
+    key = {"X-API-Key": register(client, "c-addr", "consumer")["api_key"]}
+    resp = client.post("/api/rent",
+                       json={"duration_sec": 60, "consumer_address": LOWERCASE_ADDRESS},
+                       headers=key)
+    assert resp.status_code == 400
+    # The error names the form the miner wants, so the caller can fix it.
+    assert CHECKSUMMED_ADDRESS in resp.text
+
+
+def test_rent_rejects_a_missing_consumer_address(client):
+    key = {"X-API-Key": register(client, "c-addr2", "consumer")["api_key"]}
+    resp = client.post("/api/rent", json={"duration_sec": 60}, headers=key)
+    assert resp.status_code == 400
+    assert "consumer_address" in resp.text

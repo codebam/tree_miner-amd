@@ -151,13 +151,18 @@ fn hostile_payloads_never_panic_and_never_apply() {
 }
 
 /// The same corpus against a secretless (legacy) manager. Here a well-formed *unsigned*
-/// `release` legitimately ends the lease, so the invariant is narrower: nothing may panic,
-/// and nothing that moves money or kills the process may be applied.
+/// `release` or `pause` is legitimately obeyed, so the invariant is narrower: nothing may
+/// panic, and nothing that moves money or kills the process may be applied — which now
+/// includes taking a lease at all, since `assign_task` names the address it pays.
 #[test]
 fn hostile_payloads_against_a_secretless_manager_change_nothing_that_matters() {
     let harness = Harness::new(None);
     harness.assign("lease-1", 3600);
-    assert_eq!(harness.manager.state(), PlatformState::Mining);
+    assert_eq!(
+        harness.manager.state(),
+        PlatformState::Available,
+        "an unsigned assign_task leased the rig"
+    );
 
     for (_, payload) in hostile_payloads() {
         for suffix in ["task", "control"] {
@@ -171,6 +176,7 @@ fn hostile_payloads_against_a_secretless_manager_change_nothing_that_matters() {
         "payout address changed unsigned"
     );
     assert!(!harness.manager.shutdown_requested(), "shut down unsigned");
+    assert!(harness.manager.leases().lease().is_none(), "leased unsigned");
 }
 
 /// The same corpus straight at the codec, so a future caller that skips the manager still

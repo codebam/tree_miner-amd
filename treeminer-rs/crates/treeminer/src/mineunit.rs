@@ -112,11 +112,21 @@ pub fn xuni_window_open_now() -> bool {
     tm_core::is_within_xuni_window_at(u32::from(crate::clock::now_local().minute()))
 }
 
+/// A live replacement for [`MineDeps::identity`], consulted at every batch boundary.
+///
+/// Platform mode installs one so that a lease redirects the salt without restarting the
+/// mining threads; the C++ reads `MiningCoordinator::getContext()` in the same place.
+pub type IdentitySource = Arc<dyn Fn() -> MiningIdentity + Send + Sync>;
+
 /// Everything a mining thread needs besides its device.
 pub struct MineDeps {
     pub state: Arc<MiningState>,
     pub sink: Arc<FindSink>,
+    /// The identity resolved at startup, and the one used whenever `identity_source` is
+    /// `None` — which is every run without `--platform-mode`.
     pub identity: MiningIdentity,
+    /// Remote override of `identity`. `None` means the resolved identity, unchanged.
+    pub identity_source: Option<IdentitySource>,
     /// `--batchSize`; 0 means "use all free VRAM".
     pub max_batch_size: usize,
     pub streams_per_device: usize,
@@ -130,9 +140,24 @@ impl MineDeps {
             state,
             sink,
             identity,
+            identity_source: None,
             max_batch_size: 0,
             streams_per_device: 1,
             xuni_window_open: Arc::new(xuni_window_open_now),
+        }
+    }
+
+    pub fn with_identity_source(mut self, source: IdentitySource) -> Self {
+        self.identity_source = Some(source);
+        self
+    }
+
+    /// Who this batch mines for. Read once per batch so a lease landing mid-batch takes
+    /// effect at the next boundary and never splits one batch across two identities.
+    pub fn current_identity(&self) -> MiningIdentity {
+        match &self.identity_source {
+            Some(source) => source(),
+            None => self.identity.clone(),
         }
     }
 }
@@ -219,10 +244,17 @@ impl<'a> MineUnit<'a> {
             if self.deps.state.effective_difficulty() != self.difficulty {
                 return LoopExit::DifficultyChanged;
             }
+            // A platform `pause` idles the device without tearing the unit down: the
+            // buffers stay allocated so `resume` is immediate rather than a re-plan.
+            if self.deps.state.is_mining_paused() {
+                std::thread::sleep(PAUSE_POLL);
+                continue;
+            }
 
-            let work = select_work(&self.deps.identity, batch_index);
+            let identity = self.deps.current_identity();
+            let work = select_work(&identity, batch_index);
             let keys = generate_keys(&work.key_prefix, self.batch_size);
-            let pattern = self.deps.identity.block_pattern().to_owned();
+            let pattern = identity.block_pattern().to_owned();
 
             let mut request = BatchRequest::new(&keys, &work.salt_hex, self.difficulty);
             request.target_pattern = &pattern;
@@ -356,6 +388,10 @@ fn generate_keys(prefix: &str, count: usize) -> Vec<String> {
 
 /// The default recoverable-exit backoff, as in the C++.
 pub const DEFAULT_BACKOFF: Duration = Duration::from_secs(5);
+
+/// How often a paused unit re-checks whether it may hash again. Short enough that a
+/// `resume` is not visibly delayed, long enough that a paused rig costs no CPU.
+const PAUSE_POLL: Duration = Duration::from_millis(100);
 
 #[cfg(test)]
 mod tests {

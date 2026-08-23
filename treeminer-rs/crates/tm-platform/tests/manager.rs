@@ -146,18 +146,55 @@ fn an_over_long_lifetime_is_refused_even_when_correctly_signed() {
 // --- Legacy (no secret) policy ---
 
 /// Pins: `is_mutating_command`'s fail-closed classification. Without a secret the
-/// marketplace flow still works...
+/// commands that cannot move money still work...
 #[test]
-fn without_a_secret_the_marketplace_flow_still_works() {
+fn without_a_secret_the_harmless_commands_still_work() {
     let harness = Harness::new(None);
-    harness.deliver("task", &assign_task("lease-1", 3600));
-    assert_eq!(harness.manager.state(), PlatformState::Mining);
-    harness.deliver("task", &json!({ "command": "release", "lease_id": "lease-1" }));
-    assert_eq!(harness.manager.state(), PlatformState::Available);
     harness.deliver("control", &json!({ "action": "pause" }));
     assert_eq!(harness.manager.state(), PlatformState::Idle);
     harness.deliver("control", &json!({ "action": "resume" }));
     assert_eq!(harness.manager.state(), PlatformState::Available);
+    // `release` is obeyed unsigned because its only effect is to hand the rig back; with
+    // no lease running it is a no-op, which is exactly the state a secretless rig is in.
+    harness.deliver("task", &json!({ "command": "release", "lease_id": "lease-1" }));
+    assert_eq!(harness.manager.state(), PlatformState::Available);
+    harness.deliver("task", &json!({ "command": "register_ack", "accepted": true }));
+    assert_eq!(harness.manager.state(), PlatformState::Available);
+}
+
+/// Pins: `assign_task` is a MUTATING command. It names the address every block found for
+/// the next seven days is paid to, so on a secretless rig anyone who can reach the broker
+/// would otherwise take the whole output by publishing one message.
+///
+/// The refusal must also be total: no lease, no state move, no identity change. A
+/// partially-applied refusal is worse than an accepted command, because the operator's
+/// console would still read AVAILABLE while the salt had already moved.
+#[test]
+fn without_a_secret_an_assign_task_is_refused_and_changes_nothing() {
+    let harness = Harness::new(None);
+    let identity_before = harness.coordinator.identity();
+    let context_before = harness.coordinator.context();
+
+    harness.deliver("task", &assign_task("lease-1", 3600));
+
+    assert_eq!(harness.manager.state(), PlatformState::Available);
+    assert!(harness.manager.leases().lease().is_none());
+    assert!(!harness.manager.leases().has_active_lease());
+    // The mining identity is what decides where the reward lands; nothing about it moved.
+    assert_eq!(harness.coordinator.identity(), identity_before);
+    assert_eq!(harness.coordinator.context(), context_before);
+    assert_eq!(harness.coordinator.context().mode, MiningMode::SelfMining);
+    assert_eq!(harness.coordinator.context().address, SELF_ADDRESS);
+    assert!(harness.coordinator.context().prefix.is_empty());
+    assert!(harness.coordinator.context().consumer_id.is_empty());
+    assert_eq!(harness.coordinator.difficulty(), 8);
+
+    // ...and the same message with a valid signature IS obeyed, so the refusal above is
+    // about authentication and not about the message being malformed.
+    let signed = Harness::new(Some(SECRET));
+    signed.deliver("task", &signed.sign(&assign_task("lease-1", 3600)));
+    assert_eq!(signed.manager.state(), PlatformState::Mining);
+    assert_eq!(signed.coordinator.context().address, CONSUMER_ADDRESS);
 }
 
 /// ...and every mutating command is refused. Delete the `is_mutating_command` gate and
@@ -181,6 +218,10 @@ fn without_a_secret_mutating_commands_are_refused() {
         &json!({ "action": "set_config", "config": { "difficulty": 4096 } }),
     );
     assert_eq!(harness.coordinator.difficulty(), 8);
+
+    harness.deliver("task", &assign_task("lease-1", 3600));
+    assert!(harness.manager.leases().lease().is_none());
+    assert_eq!(harness.coordinator.context().mode, MiningMode::SelfMining);
 
     // Unknown commands are mutating by default.
     harness.deliver("control", &json!({ "command": "drain_wallet" }));

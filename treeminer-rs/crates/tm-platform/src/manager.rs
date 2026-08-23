@@ -139,8 +139,9 @@ pub struct PlatformConfig {
     pub gpus: Vec<GpuInfo>,
     /// Shared secret for the HMAC envelope, from the environment (see [`crate::secret`]).
     ///
-    /// `None` is the legacy deployment: the non-mutating marketplace flow keeps working,
-    /// every mutating command is refused.
+    /// `None` is the legacy deployment: only the commands that cannot move money keep
+    /// working (`register_ack`, `release`, pause/resume); every mutating command —
+    /// `assign_task` included — is refused. See [`envelope::is_mutating_command`].
     pub command_secret: Option<Secret>,
     pub queue_capacity: usize,
     pub nonce_cache_capacity: usize,
@@ -293,8 +294,9 @@ impl<T: Transport + 'static> PlatformManager<T> {
         if self.config.command_secret.is_none() {
             tracing::warn!(
                 "SECURITY: {} is not set — MQTT commands are UNAUTHENTICATED. Lease \
-                 assignment and pause/resume remain enabled; payout-address/difficulty/\
-                 prefix/pattern changes and remote shutdown are DISABLED.",
+                 release and pause/resume remain enabled; lease ASSIGNMENT, \
+                 payout-address/difficulty/prefix/pattern changes and remote shutdown are \
+                 DISABLED. This rig cannot take platform work until the secret is set.",
                 crate::secret::ENV_COMMAND_SECRET
             );
         }
@@ -444,9 +446,10 @@ impl<T: Transport + 'static> PlatformManager<T> {
                 }
                 Ok(())
             }
-            // Legacy deployment: keep the historical non-mutating marketplace flow working
-            // so live operators are not broken, but refuse every command that could
-            // redirect payouts, change mining parameters, or kill the miner.
+            // Legacy deployment: keep working the commands that cannot move money, so live
+            // operators are not broken, but refuse every command that could redirect
+            // payouts, change mining parameters, or kill the miner — `assign_task` among
+            // them, because its `consumer_address` is exactly such a redirection.
             None if envelope::is_mutating_command(msg) => Err(RejectReason::UnsignedMutating),
             None => Ok(()),
         }

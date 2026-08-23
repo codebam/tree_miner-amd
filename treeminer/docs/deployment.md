@@ -116,7 +116,49 @@ npm run preview
 
 ### 4.1 Environment Variables
 
-The server reads all configuration from CLI arguments. For systemd or container deployments, pass them directly:
+#### `TREEMINER_PLATFORM_COMMAND_SECRET` (required)
+
+The shared secret used to sign every platform-to-worker MQTT command
+(`register_ack`, `assign_task`, `release`, and all `control` actions). It must
+match the secret each miner is configured with -- see
+[`proto/README.md`](../proto/README.md), section *Command Signing*.
+
+It is read **only** from the environment: never from a config file, a request
+parameter, or a CLI argument, so it cannot leak through the API or a process
+listing. It is never logged and never included in a response.
+
+If it is unset the server refuses to publish any command and answers `503` on
+the routes that would have sent one, with a message naming this variable.
+Leases stop being assignable -- that is deliberate: the alternative is an
+unsigned command that any broker-connected party could forge to redirect a
+rig's payout address.
+
+```bash
+# 32 random bytes, hex-encoded
+openssl rand -hex 32
+```
+
+Put it in a systemd drop-in with mode 0600, not in the unit file:
+
+```ini
+# /etc/systemd/system/xenblocks.service.d/secret.conf
+[Service]
+EnvironmentFile=/etc/xenblocks/command-secret.env
+```
+
+```bash
+# /etc/xenblocks/command-secret.env  (chmod 600, owned by the service user)
+TREEMINER_PLATFORM_COMMAND_SECRET=<the hex string>
+```
+
+Rotating it means restarting the server and every miner; commands signed with
+the old secret are rejected immediately, and in-flight envelopes expire within
+60 seconds.
+
+#### Everything else
+
+The remaining configuration comes from CLI arguments. For systemd or container
+deployments, pass them directly:
 
 ```ini
 # /etc/systemd/system/xenblocks.service

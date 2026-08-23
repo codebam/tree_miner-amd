@@ -323,8 +323,8 @@ fn signing_string_is_the_documented_shape() {
 
 #[test]
 fn mutating_command_policy() {
-    // The historical marketplace flow is non-mutating.
-    for command in ["register_ack", "assign_task", "release"] {
+    // Only the commands that cannot move money survive without a signature.
+    for command in ["register_ack", "release"] {
         assert!(!is_mutating_command(&json!({ "command": command })));
     }
     for action in ["pause", "resume"] {
@@ -335,6 +335,16 @@ fn mutating_command_policy() {
     for action in ["shutdown", "set_config", "reboot", ""] {
         assert!(is_mutating_command(&json!({ "action": action })), "{action}");
     }
+    // `assign_task` is mutating however it is dressed: its `consumer_address` redirects
+    // every block found for the length of the lease, which is the whole rig's output.
+    assert!(is_mutating_command(&json!({ "command": "assign_task" })));
+    assert!(is_mutating_command(&json!({
+        "command": "assign_task",
+        "lease_id": "lease-1",
+        "consumer_id": "consumer-1",
+        "consumer_address": "0x5aAeb6053F3E94C9b9A09f33669435E7Ef1BeAed",
+        "duration_sec": 3600,
+    })));
     assert!(is_mutating_command(&json!({ "command": "unknown_thing" })));
     assert!(is_mutating_command(&json!({})));
     assert!(is_mutating_command(&json!([])));

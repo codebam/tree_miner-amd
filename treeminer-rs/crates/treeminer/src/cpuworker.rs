@@ -17,7 +17,7 @@ use parking_lot::Mutex;
 use tm_argon2::{HashRequest, MIN_ARGON2_CPU_DIFFICULTY};
 
 use crate::find::{Find, FindSink};
-use crate::mineunit::{select_work, MiningIdentity};
+use crate::mineunit::{select_work, IdentitySource, MiningIdentity};
 use crate::state::MiningState;
 
 /// The C++ `kCpuMiningBatchSize`.
@@ -70,6 +70,10 @@ struct Shared {
     state: Arc<MiningState>,
     sink: Arc<FindSink>,
     identity: MiningIdentity,
+    /// Live override of `identity`, as on the GPU path: a platform lease must redirect the
+    /// CPU sidecar too, or the rig would keep paying part of its output to its owner while
+    /// a consumer is being billed for the whole machine.
+    identity_source: Option<IdentitySource>,
     /// The devfee rotation slot, shared by every worker so the fee share is per-process.
     work_sequence: AtomicU64,
     /// Injected so the window boundary is testable.
@@ -117,6 +121,7 @@ impl CpuMiningWorker {
                 state,
                 sink,
                 identity,
+                identity_source: None,
                 work_sequence: AtomicU64::new(0),
                 allow_xuni: Arc::new(crate::mineunit::xuni_window_open_now),
                 stop: AtomicBool::new(false),
@@ -130,6 +135,13 @@ impl CpuMiningWorker {
             }),
             threads: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Install a live identity source. Platform mode calls this before `start`.
+    pub fn set_identity_source(&mut self, source: IdentitySource) {
+        if let Some(shared) = Arc::get_mut(&mut self.shared) {
+            shared.identity_source = Some(source);
+        }
     }
 
     /// Replace the XUNI-window predicate. Tests use it; production keeps the default.
@@ -224,15 +236,27 @@ fn run_worker(shared: &Arc<Shared>, index: usize) {
         }
         shared.paused.store(false, Ordering::Release);
 
+        // A platform `pause` idles the sidecar the same way the difficulty gate does: the
+        // thread stays alive so `resume` costs nothing.
+        if shared.state.is_mining_paused() {
+            set_hashrate(shared, index, 0.0);
+            std::thread::sleep(IDLE_POLL);
+            continue;
+        }
+
+        let identity = match &shared.identity_source {
+            Some(source) => source(),
+            None => shared.identity.clone(),
+        };
         let slot = (shared.work_sequence.fetch_add(1, Ordering::Relaxed) % 1000) as i32;
-        let work = select_work(&shared.identity, slot);
+        let work = select_work(&identity, slot);
         let allow_xuni = (shared.allow_xuni)();
 
         let request = HashRequest {
             backend: "cpu".to_owned(),
             salt_hex: work.salt_hex.clone(),
             key_prefix: work.key_prefix.clone(),
-            target_pattern: shared.identity.block_pattern().to_owned(),
+            target_pattern: identity.block_pattern().to_owned(),
             difficulty,
             batch_size: shared.config.batch_size,
             device_id: index as i32,

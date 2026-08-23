@@ -6,6 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, Header, HTTPException, Query
 from starlette.requests import Request
 
+from server.command_signing import CommandSigningError
 from server.deps import get_server
 
 router = APIRouter()
@@ -182,7 +183,12 @@ async def send_worker_command(
     # Send command via MQTT
     if srv.broker:
         mqtt_command = "update_config" if command in ("list", "unlist") else command
-        await srv.broker.publish_control(worker_id, {"command": mqtt_command, **params})
+        try:
+            await srv.broker.publish_control(
+                worker_id, {"command": mqtt_command, **params}
+            )
+        except CommandSigningError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
         return {"status": "sent", "worker_id": worker_id, "command": command}
 
     raise HTTPException(status_code=503, detail="Control service unavailable")

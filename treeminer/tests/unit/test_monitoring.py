@@ -248,3 +248,35 @@ class TestRecentBlocks:
             await _insert_block(db, "w1")
         blocks = await service.get_recent_blocks(limit=3)
         assert len(blocks) == 3
+
+
+# ── Fleet overview reflects a disconnecting worker ─────────────────────────
+#
+# Regression guard for the LWT field-name bug: MqttClient publishes
+# {"worker_id", "status": "offline", ...} on disconnect, while
+# MatchingEngine.update_worker_state used to read only "state". A disconnecting
+# worker was therefore stored with an empty state and the fleet overview showed
+# it as blank rather than offline.
+
+async def test_fleet_overview_shows_offline_state_from_the_lwt(db, service):
+    from server.matcher import MatchingEngine
+
+    class _Accounts:
+        async def get_or_create_provider(self, worker_id, eth_address):
+            return {"account_id": worker_id}
+
+    class _NullBroker:
+        async def publish_task(self, worker_id, payload, qos=1):
+            pass
+
+        def require_command_secret(self):
+            pass
+
+    await _insert_worker(db, "rig-01", state="MINING")
+    engine = MatchingEngine(_NullBroker(), _Accounts(), WorkerRepo(db), None)
+    await engine.update_worker_state(
+        {"worker_id": "rig-01", "status": "offline", "timestamp": int(time.time())}
+    )
+
+    overview = await service.get_fleet_overview()
+    assert [w["state"] for w in overview] == ["offline"]

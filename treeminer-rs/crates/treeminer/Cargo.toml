@@ -26,6 +26,7 @@ tm-gpu = { workspace = true, default-features = false }
 tm-journal = { workspace = true }
 tm-submit = { workspace = true }
 tm-dashboard = { workspace = true }
+tm-platform = { workspace = true }
 tm-tui = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

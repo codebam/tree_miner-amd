@@ -1,12 +1,48 @@
 """Admin router — /api/accounts, /api/settlements, /api/status, /api/workers/{id}/control, etc."""
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from starlette.requests import Request
 
+from server.command_signing import CommandSecretMissing, CommandSigningError
 from server.deps import get_server, require_auth
 from server.models import ControlRequest
 
 router = APIRouter()
+
+
+# proto/platform_to_worker.json types the control message as `{"action": ...}`
+# with additionalProperties: false, and PlatformManager::handleControl only
+# reads `config` for set_config. Sending `config` alongside pause/resume made
+# every control message fail strict schema validation, so build the payload the
+# schema actually allows.
+CONFIG_BEARING_ACTIONS = {"set_config"}
+CONTROL_ACTIONS = {"pause", "resume", "shutdown"} | CONFIG_BEARING_ACTIONS
+
+
+def _control_payload(req: ControlRequest) -> dict:
+    """Build a schema-valid control payload, or 400 on an unknown action."""
+    if req.action not in CONTROL_ACTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown control action {req.action!r}; expected one of "
+                + ", ".join(sorted(CONTROL_ACTIONS))
+            ),
+        )
+    payload = {"action": req.action}
+    if req.action in CONFIG_BEARING_ACTIONS:
+        payload["config"] = req.config
+    elif req.config:
+        raise HTTPException(
+            status_code=400,
+            detail=f"config is only accepted with action=set_config, not {req.action!r}",
+        )
+    return payload
+
+
+def _command_unavailable(exc: CommandSigningError) -> HTTPException:
+    """503 carrying the refusal reason. The secret itself is never in `exc`."""
+    return HTTPException(status_code=503, detail=str(exc))
 
 
 # The root banner and /api/status expose only aggregate counters and are
@@ -80,8 +116,11 @@ async def send_control(
     caller: dict = Depends(require_auth("admin")),
 ):
     srv = get_server(request)
-    payload = {"action": req.action, "config": req.config}
-    await srv.broker.publish(f"xenminer/{worker_id}/control", payload)
+    payload = _control_payload(req)
+    try:
+        await srv.broker.publish_control(worker_id, payload)
+    except CommandSigningError as exc:
+        raise _command_unavailable(exc)
     return {"status": "sent", "worker_id": worker_id, "action": req.action}
 
 
@@ -92,11 +131,20 @@ async def broadcast_control(
     caller: dict = Depends(require_auth("admin")),
 ):
     srv = get_server(request)
+    payload = _control_payload(req)
+    # Refuse the whole broadcast up front rather than signing for the first N
+    # workers and failing partway through.
+    try:
+        srv.broker.require_command_secret()
+    except CommandSecretMissing as exc:
+        raise _command_unavailable(exc)
     workers = await srv.matcher.get_available_workers()
     sent_to = []
     for w in workers:
         wid = w["worker_id"]
-        payload = {"action": req.action, "config": req.config}
-        await srv.broker.publish(f"xenminer/{wid}/control", payload)
+        try:
+            await srv.broker.publish_control(wid, payload)
+        except CommandSigningError as exc:
+            raise _command_unavailable(exc)
         sent_to.append(wid)
     return {"status": "sent", "workers": sent_to, "action": req.action}

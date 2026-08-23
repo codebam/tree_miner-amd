@@ -13,6 +13,9 @@ import uuid
 from enum import Enum
 from typing import TYPE_CHECKING, List, Optional
 
+from server.command_signing import CommandSecretMissing
+from server.eth_address import describe_address_error, is_valid_ethereum_address
+
 if TYPE_CHECKING:
     from server.broker import MQTTBroker
     from server.account import AccountService
@@ -66,11 +69,18 @@ class MatchingEngine:
         # Ensure provider account exists
         await self.accounts.get_or_create_provider(worker_id, msg.get("eth_address", ""))
 
-        # Send register_ack
-        await self.broker.publish(
-            f"xenminer/{worker_id}/task",
-            {"command": "register_ack", "accepted": True},
-        )
+        # Send register_ack. A worker that never gets one stays IDLE, but that
+        # is strictly better than publishing an unsigned command: refuse loudly
+        # so the operator sees the missing secret instead of a silent takeover
+        # surface.
+        try:
+            await self.broker.publish_task(
+                worker_id,
+                {"command": "register_ack", "accepted": True},
+            )
+        except CommandSecretMissing as exc:
+            logger.error("Cannot acknowledge registration of %s: %s", worker_id, exc)
+            return False
         logger.info("Worker %s registered (%d GPUs, %dGB)",
                      worker_id, msg.get("gpu_count", 0), msg.get("total_memory_gb", 0))
         return True
@@ -93,9 +103,24 @@ class MatchingEngine:
             await self._leases.update_hashrate_stats(lease["lease_id"], hashrate)
 
     async def update_worker_state(self, msg: dict):
-        """Update a worker's state from an incoming status message."""
+        """Update a worker's state from an incoming status message.
+
+        Two shapes arrive on the status topic. Ordinary transitions carry
+        `state` (proto/worker_to_platform.json `status`). The Last Will and the
+        clean-disconnect notice carry `status` instead -- MqttClient.cpp builds
+        `{"worker_id", "status": "offline", "timestamp"}` and the Rust port
+        keeps that shape verbatim. Reading only `state` recorded a disconnecting
+        worker with an empty state, so it never showed as offline anywhere.
+        Accept both, and never overwrite a known state with an empty one.
+        """
         worker_id = msg.get("worker_id", "")
-        state = msg.get("state", "")
+        state = msg.get("state") or msg.get("status") or ""
+        if not worker_id:
+            logger.debug("Ignoring status message without a worker_id")
+            return
+        if not state:
+            logger.debug("Ignoring status message for %s with no state", worker_id)
+            return
         await self._workers.update_state(worker_id, state)
         logger.debug("Worker %s state -> %s", worker_id, state)
 
@@ -135,7 +160,19 @@ class MatchingEngine:
         duration_sec: int = 3600,
         worker_id: Optional[str] = None,
     ) -> Optional[dict]:
-        """Create a lease: match consumer to an available worker."""
+        """Create a lease: match consumer to an available worker.
+
+        Raises ValueError for a consumer_address the miner would refuse, and
+        CommandSecretMissing when no command-signing secret is configured. Both
+        checks run BEFORE any state is written: a lease the worker will never
+        accept is worse than no lease, because the platform would bill for it.
+        """
+        if not is_valid_ethereum_address(consumer_address):
+            raise ValueError(describe_address_error(consumer_address))
+        # Fail before mutating: the assign_task publish below must be able to
+        # sign, or the worker sits LEASED with no task.
+        self.broker.require_command_secret()
+
         async with self._lock:
             # Find an available worker
             target = None
@@ -177,9 +214,9 @@ class MatchingEngine:
             )
             await self._workers.update_state(target["worker_id"], "LEASED")
 
-        # Send assign_task to worker
-        await self.broker.publish(
-            f"xenminer/{target['worker_id']}/task",
+        # Send assign_task to worker (signed; see server/command_signing.py)
+        await self.broker.publish_task(
+            target["worker_id"],
             {
                 "command": "assign_task",
                 "lease_id": lease_id,
@@ -195,6 +232,8 @@ class MatchingEngine:
 
     async def stop_lease(self, lease_id: str) -> Optional[dict]:
         """Stop a lease early by sending release to the worker."""
+        # Same ordering rule as rent_hashpower: refuse before mutating.
+        self.broker.require_command_secret()
         async with self._lock:
             lease = await self._leases.get(lease_id)
             if lease is None or lease["state"] != "active":
@@ -202,9 +241,8 @@ class MatchingEngine:
             await self._leases.update_state(lease_id, "completed", ended_at=time.time())
             await self._workers.update_state(lease["worker_id"], "AVAILABLE")
 
-        await self.broker.publish(
-            f"xenminer/{lease['worker_id']}/task",
-            {"command": "release", "lease_id": lease_id},
+        await self.broker.publish_task(
+            lease["worker_id"], {"command": "release", "lease_id": lease_id}
         )
         logger.info("Lease %s stopped (worker=%s)", lease_id, lease["worker_id"])
         # Return updated lease
@@ -217,10 +255,20 @@ class MatchingEngine:
         for lease in expired_leases:
             await self._leases.update_state(lease["lease_id"], "completed", ended_at=time.time())
             await self._workers.update_state(lease["worker_id"], "AVAILABLE")
-            await self.broker.publish(
-                f"xenminer/{lease['worker_id']}/task",
-                {"command": "release", "lease_id": lease["lease_id"]},
-            )
+            # The watchdog runs on a timer with no caller to report to, so a
+            # missing secret is logged per lease rather than raised. The lease
+            # is still closed and settled: expiry is time-driven and the worker
+            # enforces it locally too, so the release is a courtesy nudge.
+            try:
+                await self.broker.publish_task(
+                    lease["worker_id"],
+                    {"command": "release", "lease_id": lease["lease_id"]},
+                )
+            except CommandSecretMissing as exc:
+                logger.error(
+                    "Lease %s expired but the release command could not be signed: %s",
+                    lease["lease_id"], exc,
+                )
             # Re-fetch with updated state
             updated = await self._leases.get(lease["lease_id"])
             completed.append(updated)

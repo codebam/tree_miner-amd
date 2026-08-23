@@ -24,6 +24,7 @@ use crate::bridge::JournalBridge;
 use crate::cpuworker::{CpuMiningWorker, CpuWorkerConfig, DEFAULT_CPU_BATCH_SIZE};
 use crate::find::FindSink;
 use crate::mineunit::{run_mining_on_device, MineDeps, MiningIdentity, DEFAULT_BACKOFF};
+use crate::platform::MqttRuntime;
 use crate::resolve::{absolute_path, ResolvedConfig};
 use crate::selftest::{run_self_test, BACKEND_NAME};
 use crate::state::{MiningState, DEFAULT_GPU_FIRST_BLOCKS};
@@ -106,6 +107,30 @@ pub fn run(config: &ResolvedConfig) -> u8 {
         .ok()
         .map(Arc::new);
 
+    // --- platform mode ---
+    // Before the journal, the submitter and the network threads: a missing credential is a
+    // configuration error, and the operator should learn about it in a second rather than
+    // after a self-test and a journal recovery. Nothing here runs at all without the flag.
+    let identity = mining_identity(config);
+    let platform = match crate::platform::start_if_enabled(
+        &crate::platform::PlatformOptions {
+            enabled: config.platform_mode,
+            broker_uri: &config.mqtt_broker,
+            worker_id: &machine_id,
+            eth_address: &config.miner_address,
+        },
+        &mining_devices,
+        &device_names,
+        &identity,
+        &state,
+    ) {
+        Ok(platform) => platform,
+        Err(error) => {
+            eprintln!("{error}");
+            return EXIT_FAILURE;
+        }
+    };
+
     // --- journal ---
     let journal_path = config.journal_path.clone();
     let journal = match FindJournal::open(&journal_path) {
@@ -168,6 +193,9 @@ pub fn run(config: &ResolvedConfig) -> u8 {
         let manager = Arc::clone(manager);
         sink = sink.with_notifier(Arc::new(move || manager.notify_find_appended()));
     }
+    if let Some(platform) = &platform {
+        sink = sink.with_observer(platform.find_observer());
+    }
     let sink = Arc::new(sink);
 
     // --- stats ---
@@ -176,16 +204,21 @@ pub fn run(config: &ResolvedConfig) -> u8 {
         config.dashboard_port,
         &tm_dashboard::SystemInterfaces,
     );
-    let publisher = Arc::new(
-        stats_publisher(config, &machine_id, &console_url, &state, &journal, submission.as_ref()),
-    );
+    let publisher = Arc::new(stats_publisher(
+        config,
+        &machine_id,
+        &console_url,
+        &state,
+        &journal,
+        submission.as_ref(),
+        platform.as_ref(),
+    ));
 
     // --- display ---
     let terminal_ui = start_display(config, &publisher);
 
     // --- CPU sidecar ---
-    let identity = mining_identity(config);
-    let cpu = start_cpu_workers(config, &state, &sink, &identity);
+    let cpu = start_cpu_workers(config, &state, &sink, &identity, platform.as_ref());
 
     for index in &mining_devices {
         let name = device_names
@@ -200,6 +233,9 @@ pub fn run(config: &ResolvedConfig) -> u8 {
         state: Arc::clone(&state),
         sink: Arc::clone(&sink),
         identity,
+        // Platform mode redirects the salt per batch; without it this stays `None` and the
+        // loop reads the resolved identity directly, as it always has.
+        identity_source: platform.as_ref().map(|platform| platform.identity_source()),
         max_batch_size: config.max_batch_size,
         streams_per_device: config.gpu_streams_per_device,
         xuni_window_open: Arc::new(crate::mineunit::xuni_window_open_now),
@@ -235,6 +271,7 @@ pub fn run(config: &ResolvedConfig) -> u8 {
                 terminal_ui,
                 poller_thread,
                 submission,
+                platform,
             );
         }
     };
@@ -260,8 +297,10 @@ pub fn run(config: &ResolvedConfig) -> u8 {
         terminal_ui,
         poller_thread,
         submission,
+        platform,
     )
 }
+
 
 /// Enumerate and select devices, or explain why mining cannot start. Returns the selected
 /// indices and every device's display name.
@@ -598,6 +637,7 @@ fn stats_publisher(
     state: &Arc<MiningState>,
     journal: &Arc<dyn Journal + Send + Sync>,
     submission: Option<&Arc<Manager>>,
+    platform: Option<&Arc<MqttRuntime>>,
 ) -> StatsPublisher {
     let mut publisher = StatsPublisher::new(
         Arc::clone(state),
@@ -624,6 +664,9 @@ fn stats_publisher(
                 last_observed_difficulty: manager.last_observed_difficulty(),
             })
         }));
+    }
+    if let Some(platform) = platform {
+        publisher = publisher.with_platform(platform.status_provider());
     }
     publisher
 }
@@ -657,6 +700,7 @@ fn start_cpu_workers(
     state: &Arc<MiningState>,
     sink: &Arc<FindSink>,
     identity: &MiningIdentity,
+    platform: Option<&Arc<MqttRuntime>>,
 ) -> Option<CpuMiningWorker> {
     if config.cpu_worker_count == 0 {
         return None;
@@ -678,7 +722,10 @@ fn start_cpu_workers(
         identity.clone(),
     );
     match worker {
-        Ok(worker) => {
+        Ok(mut worker) => {
+            if let Some(platform) = platform {
+                worker.set_identity_source(platform.identity_source());
+            }
             worker.start();
             Some(worker)
         }
@@ -863,8 +910,12 @@ fn finish(
     terminal_ui: Option<Arc<TerminalUi>>,
     poller: Option<std::thread::JoinHandle<()>>,
     submission: Option<Arc<Manager>>,
+    platform: Option<Arc<MqttRuntime>>,
 ) -> u8 {
     state.shutdown().request_stop();
+    // A pause must not outlive the run: the producers below poll the flag, and joining a
+    // thread that is politely idling is a hang, not a shutdown.
+    state.set_mining_paused(false);
 
     if let Some(cpu) = &cpu {
         cpu.stop();
@@ -883,6 +934,12 @@ fn finish(
         Console::global().clear_event_forwarder();
         Console::global().clear_line_sink();
         ui.stop();
+    }
+
+    // After the producers have joined, so a find made on the way down is still reported,
+    // and before the submitter, which is the last thing holding the journal.
+    if let Some(platform) = platform {
+        platform.stop();
     }
 
     if let Some(manager) = submission {

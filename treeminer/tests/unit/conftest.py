@@ -5,6 +5,24 @@ import re
 import string
 
 
+# ── Platform command signing ────────────────────────────────────────────────
+#
+# The server refuses to publish an unsigned platform->worker command, so every
+# test that drives a publish path needs a configured secret. Set one for the
+# whole unit suite; tests that assert the *refusal* path opt out with
+# monkeypatch.delenv(). It is set per test (not once at import) so a test can
+# delete it without leaking the change into the next one.
+
+PLATFORM_COMMAND_SECRET_ENV = "TREEMINER_PLATFORM_COMMAND_SECRET"
+TEST_COMMAND_SECRET = "unit-test-command-secret"
+
+
+@pytest.fixture(autouse=True)
+def platform_command_secret(monkeypatch):
+    monkeypatch.setenv(PLATFORM_COMMAND_SECRET_ENV, TEST_COMMAND_SECRET)
+    return TEST_COMMAND_SECRET
+
+
 # ── Constants mirroring C++ MiningCommon.h ──────────────────────────────────
 
 HASH_LENGTH = 64

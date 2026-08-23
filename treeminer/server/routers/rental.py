@@ -5,7 +5,9 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Header, HTTPException
 from starlette.requests import Request
 
+from server.command_signing import CommandSigningError
 from server.deps import get_server, require_auth
+from server.eth_address import describe_address_error, is_valid_ethereum_address
 from server.models import RentRequest, StopRequest
 
 router = APIRouter()
@@ -30,12 +32,25 @@ async def rent_hashpower(
         consumer_address = req.consumer_address or caller.get("eth_address", "")
     if not consumer_id:
         raise HTTPException(status_code=400, detail="consumer_id required")
-    lease = await srv.matcher.rent_hashpower(
-        consumer_id=consumer_id,
-        consumer_address=consumer_address,
-        duration_sec=req.duration_sec,
-        worker_id=req.worker_id,
-    )
+    # The miner requires a full EIP-55 checksummed address and refuses anything
+    # else. Accepting a lowercase address here produced a lease the worker
+    # silently rejected while the platform kept billing for it, so reject at the
+    # boundary with the reason instead.
+    if not is_valid_ethereum_address(consumer_address):
+        raise HTTPException(
+            status_code=400, detail=describe_address_error(consumer_address)
+        )
+    try:
+        lease = await srv.matcher.rent_hashpower(
+            consumer_id=consumer_id,
+            consumer_address=consumer_address,
+            duration_sec=req.duration_sec,
+            worker_id=req.worker_id,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except CommandSigningError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     if lease is None:
         raise HTTPException(status_code=404, detail="No available workers")
     return {
@@ -62,7 +77,10 @@ async def stop_lease(
         raise HTTPException(status_code=404, detail="Lease not found or not active")
     if caller["role"] != "admin" and caller["account_id"] != existing["consumer_id"]:
         raise HTTPException(status_code=403, detail="You can only stop your own leases")
-    lease = await srv.matcher.stop_lease(req.lease_id)
+    try:
+        lease = await srv.matcher.stop_lease(req.lease_id)
+    except CommandSigningError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
     if lease is None:
         raise HTTPException(status_code=404, detail="Lease not found or not active")
     record = await srv.settlement.settle_lease(lease)

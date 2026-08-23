@@ -400,9 +400,19 @@ pub fn verify_envelope(
 // --- Policy classification ---
 
 /// When NO secret is configured (legacy deployments), the miner keeps accepting the
-/// non-mutating marketplace flow it always accepted — registration acks, lease
-/// assignment/release, pause/resume — but never state-mutating commands (payout address /
-/// difficulty / prefix / pattern changes, remote shutdown).
+/// handful of commands that cannot move money — the registration ack, releasing a lease,
+/// pause/resume — and refuses everything else: `assign_task`, payout address / difficulty
+/// / prefix / pattern changes, and remote shutdown.
+///
+/// # Why `assign_task` counts as mutating
+///
+/// The C++ classified it as part of the "non-mutating marketplace flow", because a lease
+/// only *steers* the rig rather than editing its configuration. That reasoning is wrong.
+/// `assign_task` carries a `consumer_address` and points every block found for up to seven
+/// days at it, so on an unsigned deployment anyone who can publish to the broker takes the
+/// rig's entire output by sending one message. It moves money, so it needs a signature.
+/// `release` stays unsigned-legal in the other direction: its only effect is to hand the
+/// rig back to its owner, which is never worth forging.
 ///
 /// Fail-closed: unknown commands and unknown control actions count as mutating.
 pub fn is_mutating_command(msg: &Value) -> bool {
@@ -411,10 +421,10 @@ pub fn is_mutating_command(msg: &Value) -> bool {
     }
     let command = string_field(msg, "command").unwrap_or("");
 
-    // The historical non-mutating marketplace flow: these only steer which lease the rig
-    // serves or pause/resume availability — they never change payout identity, difficulty,
-    // key prefix, or block pattern, and cannot kill the process.
-    if matches!(command, "register_ack" | "assign_task" | "release") {
+    // These cannot redirect a payout, change a mining parameter, or kill the process:
+    // `register_ack` only confirms the registration we sent, and `release` only ends a
+    // lease and returns the rig to self-mining.
+    if matches!(command, "register_ack" | "release") {
         return false;
     }
 

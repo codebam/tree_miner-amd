@@ -2275,6 +2275,7 @@ dependencies = [
  "tm-dashboard",
  "tm-gpu",
  "tm-journal",
+ "tm-platform",
  "tm-submit",
  "tm-tui",
  "tokio",

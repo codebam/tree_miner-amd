@@ -41,6 +41,7 @@ from server.auth import (
 )
 from server.broker import MQTTBroker
 from server.chain_simulator import ChainSimulator
+from server.command_signing import SECRET_ENV_VAR
 from server.dashboard import register_dashboard
 from server.matcher import MatchingEngine
 from server.monitoring import MonitoringService
@@ -268,6 +269,24 @@ class PlatformServer:
     async def start(self):
         """Start storage, broker, watchdog, and API server."""
         await self._init_services()
+
+        # Say it once, loudly, at boot: without the shared secret every
+        # platform->worker command is refused at publish time, so leases and
+        # control simply stop working. Better a startup banner than a pile of
+        # 503s nobody can explain. The value itself is never logged.
+        if self.broker.command_secret_available():
+            logger.info(
+                "Platform commands will be signed (%s is set)",
+                SECRET_ENV_VAR,
+            )
+        else:
+            logger.warning(
+                "%s is not set: the platform will REFUSE to publish any "
+                "worker command (register_ack, assign_task, release, control). "
+                "Set it in the server's environment to the same secret the "
+                "miners are configured with.",
+                SECRET_ENV_VAR,
+            )
 
         await self.broker.start()
         logger.info("MQTT broker started on port %d", self.mqtt_port)

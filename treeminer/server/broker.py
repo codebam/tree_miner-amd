@@ -18,7 +18,19 @@ import struct
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Set, Tuple
 
+from server.command_signing import (
+    MAX_PAYLOAD_BYTES,
+    CommandNotSignable,
+    CommandSecretMissing,
+    CommandSigner,
+    is_safe_identifier,
+)
+
 logger = logging.getLogger("broker")
+
+#: Topic suffixes that carry platform -> worker commands. Everything published
+#: on one of these MUST be signed; see server/command_signing.py.
+COMMAND_TOPIC_SUFFIXES = ("task", "control")
 
 
 # ---------------------------------------------------------------------------
@@ -127,13 +139,99 @@ MessageHandler = Callable[[str, dict, str], Coroutine[Any, Any, None]]
 class MQTTBroker:
     """Minimal async MQTT 3.1.1 broker for local testing."""
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 1883):
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 1883,
+        command_signer: Optional[CommandSigner] = None,
+    ):
         self.host = host
         self.port = port
         self._clients: Dict[str, ClientSession] = {}
         self._server: Optional[asyncio.AbstractServer] = None
         self._handlers: List[MessageHandler] = []
         self._lock = asyncio.Lock()
+        # Single signer for every command this broker emits, so nonce
+        # bookkeeping is shared across all publish paths.
+        self._command_signer = command_signer or CommandSigner()
+
+    # -----------------------------------------------------------------------
+    # Signed command publishing
+    #
+    # Every platform -> worker command goes through publish_command(). Callers
+    # must not reach for publish() with a task/control topic: publish() refuses
+    # those outright so a new code path cannot quietly ship an unsigned command.
+    # -----------------------------------------------------------------------
+
+    @property
+    def command_signer(self) -> CommandSigner:
+        return self._command_signer
+
+    def command_secret_available(self) -> bool:
+        """True iff commands can be signed. Never exposes the secret itself."""
+        return self._command_signer.secret_available()
+
+    def require_command_secret(self) -> None:
+        """Raise CommandSecretMissing unless commands can be signed.
+
+        Call before mutating state so a missing secret aborts the whole
+        operation rather than leaving the platform and the rig disagreeing.
+        """
+        self._command_signer.require_secret()
+
+    async def publish_command(
+        self,
+        worker_id: str,
+        suffix: str,
+        payload: dict,
+        qos: int = 1,
+        command_id: Optional[str] = None,
+    ):
+        """Sign ``payload`` for ``worker_id`` and publish it on its command topic.
+
+        Raises CommandSecretMissing when no shared secret is configured, and
+        CommandNotSignable for a malformed worker id / suffix / payload. Both
+        are deliberately loud: dropping to an unsigned publish would either be
+        rejected by a secret-configured miner or obeyed by one without a
+        secret, and the second case is the takeover this envelope exists to
+        prevent.
+        """
+        if suffix not in COMMAND_TOPIC_SUFFIXES:
+            raise CommandNotSignable(
+                f"Unknown command topic suffix {suffix!r}; expected one of "
+                f"{COMMAND_TOPIC_SUFFIXES}"
+            )
+        if not is_safe_identifier(worker_id):
+            raise CommandNotSignable(
+                f"Refusing to publish to an unsafe worker id {worker_id!r}"
+            )
+        signed = self._command_signer.sign(payload, worker_id, command_id=command_id)
+
+        # The miner drops any payload over this size before parsing it, so a
+        # publish that exceeds it is a silent no-op on the rig. Fail here where
+        # the caller can see it.
+        size = len(json.dumps(signed).encode("utf-8"))
+        if size > MAX_PAYLOAD_BYTES:
+            raise CommandNotSignable(
+                f"Command for {worker_id} is {size} bytes, over the "
+                f"{MAX_PAYLOAD_BYTES}-byte cap the worker enforces"
+            )
+
+        await self._publish_raw(f"xenminer/{worker_id}/{suffix}", signed, qos)
+        logger.info(
+            "Signed %s command for %s (command_id=%s)",
+            suffix,
+            worker_id,
+            signed["auth"]["command_id"],
+        )
+
+    async def publish_task(self, worker_id: str, payload: dict, qos: int = 1):
+        """Publish a signed lease command (register_ack / assign_task / release)."""
+        await self.publish_command(worker_id, "task", payload, qos)
+
+    async def publish_control(self, worker_id: str, payload: dict, qos: int = 1):
+        """Publish a signed control command (pause / resume / shutdown / config)."""
+        await self.publish_command(worker_id, "control", payload, qos)
 
     def on_message(self, handler: MessageHandler):
         """Register an async callback invoked on every PUBLISH from a client."""
@@ -155,7 +253,23 @@ class MQTTBroker:
             self._clients.clear()
 
     async def publish(self, topic: str, payload: Any, qos: int = 1):
-        """Publish a message from the platform (server-side) to matching clients."""
+        """Publish a non-command message from the platform to matching clients.
+
+        Command topics are rejected here on purpose: they must go through
+        publish_command() so they are signed. This is the guard rail that keeps
+        a future publisher from re-introducing the unsigned-command hole.
+        """
+        parts = topic.split("/")
+        if len(parts) == 3 and parts[0] == "xenminer" and parts[2] in COMMAND_TOPIC_SUFFIXES:
+            raise CommandNotSignable(
+                f"{topic} is a platform->worker command topic: use "
+                "publish_command()/publish_task()/publish_control() so the "
+                "message is signed"
+            )
+        await self._publish_raw(topic, payload, qos)
+
+    async def _publish_raw(self, topic: str, payload: Any, qos: int = 1):
+        """Serialise and fan out to subscribers. No signing policy applied."""
         if isinstance(payload, (dict, list)):
             raw = json.dumps(payload).encode("utf-8")
         elif isinstance(payload, str):

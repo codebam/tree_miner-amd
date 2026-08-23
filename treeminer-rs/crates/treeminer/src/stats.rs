@@ -157,6 +157,10 @@ pub fn last_submission_label(state: LastSubmissionState, age: Option<Duration>) 
 pub type SubmissionProvider = Arc<dyn Fn() -> Option<SubmissionView> + Send + Sync>;
 /// Pulls the journal's per-status counts, if there is a journal.
 pub type JournalProvider = Arc<dyn Fn() -> Option<tm_journal::Counts> + Send + Sync>;
+/// Pulls platform mode's state and lease, if platform mode is running. `None` renders the
+/// C++ "disabled" shape, which is what a miner without `--platform-mode` serves.
+pub type PlatformProvider =
+    Arc<dyn Fn() -> Option<tm_dashboard::stats::PlatformStatus> + Send + Sync>;
 
 /// Identity and presentation settings that never change during a run.
 #[derive(Debug, Clone, Default)]
@@ -174,6 +178,7 @@ pub struct StatsPublisher {
     identity: StatsIdentity,
     submission: Option<SubmissionProvider>,
     journal: Option<JournalProvider>,
+    platform: Option<PlatformProvider>,
 }
 
 impl std::fmt::Debug for StatsPublisher {
@@ -191,6 +196,7 @@ impl StatsPublisher {
             identity,
             submission: None,
             journal: None,
+            platform: None,
         }
     }
 
@@ -201,6 +207,11 @@ impl StatsPublisher {
 
     pub fn with_journal(mut self, provider: JournalProvider) -> Self {
         self.journal = Some(provider);
+        self
+    }
+
+    pub fn with_platform(mut self, provider: PlatformProvider) -> Self {
+        self.platform = Some(provider);
         self
     }
 
@@ -300,7 +311,7 @@ impl StatsPublisher {
                 lying_200_detected: view.metrics.confirm_body_rejected,
                 probes: view.metrics.probes,
             }),
-            platform: None,
+            platform: self.platform.as_ref().and_then(|provider| provider()),
         }
     }
 

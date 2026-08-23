@@ -21,6 +21,7 @@ pub mod find;
 pub mod hashcli;
 pub mod machineid;
 pub mod mineunit;
+pub mod platform;
 pub mod prompt;
 pub mod resolve;
 pub mod run;
@@ -48,10 +49,14 @@ pub use resolve::{resolve, ResolveError, ResolveOptions, ResolvedConfig};
 pub use backend::{DeviceFacts, GpuMiningBackend, GpuSelfTestProbe, MiningBackend};
 pub use bridge::JournalBridge;
 pub use cpuworker::{CpuMiningWorker, CpuStats, CpuWorkerConfig, CpuWorkerError};
-pub use find::{Capture, Find, FindSink};
+pub use find::{Capture, Find, FindObserver, FindSink};
 pub use mineunit::{
-    run_mining_on_device, select_work, xuni_window_open_now, LoopExit, MineDeps, MineUnit,
-    MiningIdentity, Work,
+    run_mining_on_device, select_work, xuni_window_open_now, IdentitySource, LoopExit, MineDeps,
+    MineUnit, MiningIdentity, Work,
+};
+pub use platform::{
+    gpu_infos, start_if_enabled, start_mqtt, MqttRuntime, PlatformError, PlatformOptions,
+    PlatformRuntime,
 };
 pub use run::run;
 pub use selftest::{run_self_test, DeviceDecision, SelfTestProbe, SelfTestReport};

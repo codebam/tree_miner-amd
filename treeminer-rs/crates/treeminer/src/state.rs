@@ -58,6 +58,11 @@ pub struct MiningState {
     fatal_durability: AtomicBool,
     fatal_reason: Mutex<String>,
 
+    /// Set by a platform `pause`, cleared by `resume`. Distinct from [`Shutdown`]: a pause
+    /// is reversible and every thread stays alive, so it cannot be expressed by the
+    /// shutdown flag without ending the run.
+    mining_paused: AtomicBool,
+
     shutdown: Arc<Shutdown>,
     started_at: Instant,
 }
@@ -84,6 +89,7 @@ impl MiningState {
             telemetry: Mutex::new(BTreeMap::new()),
             fatal_durability: AtomicBool::new(false),
             fatal_reason: Mutex::new(String::new()),
+            mining_paused: AtomicBool::new(false),
             shutdown,
             started_at: Instant::now(),
         }
@@ -103,6 +109,17 @@ impl MiningState {
 
     pub fn is_running(&self) -> bool {
         self.shutdown.is_running()
+    }
+
+    /// True while a platform `pause` is in force. Producers idle instead of hashing; they
+    /// do NOT exit, so a `resume` restarts them without rebuilding a device context.
+    pub fn is_mining_paused(&self) -> bool {
+        self.mining_paused.load(Ordering::Acquire)
+    }
+
+    /// Returns the previous value so the caller logs only real transitions.
+    pub fn set_mining_paused(&self, paused: bool) -> bool {
+        self.mining_paused.swap(paused, Ordering::AcqRel)
     }
 
     pub fn started_at(&self) -> Instant {
