@@ -12,10 +12,17 @@ path = "src/lib.rs"
 name = "treeminer"
 path = "src/main.rs"
 
+[features]
+default = ["amd"]
+# Forwarded straight to tm-gpu, which is where they mean something. `amd` is the tested
+# vendor; `nvidia` is compile-verified and has never been executed — see PORT.md.
+amd = ["tm-gpu/amd"]
+nvidia = ["tm-gpu/nvidia"]
+
 [dependencies]
 tm-core = { workspace = true }
 tm-argon2 = { workspace = true }
-tm-gpu = { workspace = true }
+tm-gpu = { workspace = true, default-features = false }
 tm-journal = { workspace = true }
 tm-submit = { workspace = true }
 tm-dashboard = { workspace = true }

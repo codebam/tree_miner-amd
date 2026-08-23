@@ -1,24 +1,41 @@
-//! TreeMiner's Argon2 device kernels, in Rust, compiled for `amdgcn-amd-amdhsa`.
+//! TreeMiner's Argon2 device kernels, in Rust, for AMD **and** NVIDIA.
 //!
-//! This crate is never built for the host. `tm-gpu`'s `build.rs` compiles it to an AMDGPU
-//! code object which the runtime loads with `hipModuleLoad`; see PORT.md, "Rust GPU
-//! kernels", for the toolchain and why it is staged behind the `rust-kernel` feature.
+//! This crate is never built for the host. `tm-gpu`'s `build.rs` compiles it twice over,
+//! for whichever vendor is selected:
+//!
+//! | target | loaded by | status |
+//! | --- | --- | --- |
+//! | `amdgcn-amd-amdhsa` | `hipModuleLoad` (`tm-gpu/src/module.rs`) | **tested** on gfx1100 |
+//! | `nvptx64-nvidia-cuda`, as PTX | `cuModuleLoadData` (`tm-gpu/src/cuda/module.rs`) | **compiles; never executed** |
+//!
+//! See PORT.md, "Rust GPU kernels", for the toolchain and its failure modes.
+//!
+//! The Argon2 arithmetic below is written once. Everything that differs between the two
+//! vendors — the thread/block index intrinsics, the 32-lane shuffles, the kernel entry ABI —
+//! is in [`arch`], which has one implementation per target. The amdgcn arm of every cfg is
+//! the token stream the kernel had before NVIDIA existed, deliberately: the AMD code object
+//! is byte for byte what it was, which is the regression gate for this abstraction.
 //!
 //! Port of the `__device__` / `__global__` half of `../tm-gpu/kernel/argon2_kernel.hip`.
 //! Behaviour must match that file bit for bit: the two are cross-checked against each other
-//! by `first_blocks_differential` in `tm-gpu/src/runner.rs`, and a silent divergence costs
-//! real submissions (commit 12e241c).
+//! by `kernel_differential` in `tm-gpu/src/runner.rs`, and a silent divergence costs real
+//! submissions (commit 12e241c). That cross-check exists only on AMD — there is no hipcc
+//! oracle for the NVIDIA build, which is one more reason the NVIDIA path is unproven.
 //!
 //! Both kernels are ported. `argon2_first_blocks_kernel` (stage 1) is plain per-work-item
 //! arithmetic — no wavefront shuffles, no shared memory, one Argon2 job per thread.
 //! `argon2_kernel_oneshot` (stage 2) is the hot loop: one workgroup of 32 work-items per
-//! job, the block spread across the wavefront, and `ds_bpermute` shuffles in place of the
+//! job, the block spread across the wavefront, and cross-lane shuffles in place of the
 //! C++'s per-thread LDS scratch.
 
 #![no_std]
-#![feature(abi_gpu_kernel, link_llvm_intrinsics)]
-// `link_llvm_intrinsics` is the only way to reach the AMDGPU workitem/workgroup ids from
-// Rust; there is no stable equivalent.
+#![feature(link_llvm_intrinsics)]
+// The kernel-entry ABI is spelled differently per vendor and each spelling is its own
+// unstable feature; `arch::gpu_kernel!` picks the item, but the gate has to be here.
+#![cfg_attr(target_arch = "amdgpu", feature(abi_gpu_kernel))]
+#![cfg_attr(target_arch = "nvptx64", feature(abi_ptx))]
+// `link_llvm_intrinsics` is the only way to reach the workitem/workgroup ids and the
+// cross-lane shuffles from Rust; there is no stable equivalent on either vendor.
 #![allow(internal_features)]
 // The kernel entry point is `unsafe extern "gpu-kernel"`; every pointer it touches is a
 // device allocation the host sized, so the whole file is unsafe by nature and marking each
@@ -37,12 +54,9 @@ fn panic(_: &PanicInfo) -> ! {
     }
 }
 
-extern "C" {
-    #[link_name = "llvm.amdgcn.workitem.id.x"]
-    fn workitem_id_x() -> u32;
-    #[link_name = "llvm.amdgcn.workgroup.id.x"]
-    fn workgroup_id_x() -> u32;
-}
+mod arch;
+
+use arch::{gpu_kernel, shfl32, shfl_xor32, workgroup_id_x, workitem_id_x, THREADS_PER_LANE};
 
 const ARGON2_BLOCK_SIZE: usize = 1024;
 const ARGON2_SYNC_POINTS: u32 = 4;
@@ -113,6 +127,27 @@ fn rotr64(x: u64, n: u32) -> u64 {
     x.rotate_right(n)
 }
 
+/// A slot in [`Blake2b::buf`], which is `BLAKE2B_BLOCK_BYTES` (a power of two) long.
+///
+/// Same story as [`sigma!`]: the callers only ever produce an index below the buffer
+/// length, but on nvptx64 LLVM cannot prove it, and an unprovable index means a call to
+/// `core::panicking::panic_bounds_check` that no PTX module can resolve. The mask makes it
+/// provable without changing any in-range result. The amdgcn arm is the original token
+/// stream, so the tested code object is untouched.
+#[cfg(not(target_arch = "nvptx64"))]
+macro_rules! buf_slot {
+    ($index:expr) => {
+        $index
+    };
+}
+
+#[cfg(target_arch = "nvptx64")]
+macro_rules! buf_slot {
+    ($index:expr) => {
+        $index & (BLAKE2B_BLOCK_BYTES - 1)
+    };
+}
+
 /// `Blake2bDeviceState`. Lives entirely in registers/private scratch, one per work-item.
 struct Blake2b {
     h: [u64; 8],
@@ -121,18 +156,43 @@ struct Blake2b {
     buf_len: u32,
 }
 
+/// One entry of [`BLAKE2B_SIGMA`], as an index into the 16-word message block.
+///
+/// On nvptx64 the `& 15` is what makes it an index the compiler can prove in range. Every
+/// entry of the table is below 16, so the mask cannot change a result — but LLVM does not
+/// unroll the round loop for that target, so without it the lookup keeps a bounds check and
+/// the kernel emits calls to `core::panicking::panic_bounds_check`, which no PTX module can
+/// resolve: there is nothing to link them against.
+///
+/// It is deliberately *not* applied on amdgcn, and this is a macro rather than a function
+/// so that the amdgcn arm is the same token stream the kernel had before NVIDIA existed —
+/// the AMD code object stays byte for byte identical, which is the regression gate.
+///
+/// The mask is applied on every target. Sigma entries are 0..=15 by construction, so it
+/// changes no value — it tells the compiler that, which is what removes the bounds check.
+/// On nvptx that is load-bearing: a bounds check becomes a call to
+/// `core::panicking::panic_bounds_check`, which no PTX module can resolve. On amdgcn it
+/// buys registers: measured on gfx1100 it takes `argon2_first_blocks_kernel` from 249 SGPR
+/// and 11 VGPR spills at 192 VGPRs to zero spills at 128, with scratch down from 1264 to
+/// 576 bytes. `argon2_kernel_oneshot` is unaffected — it was already spill-free.
+macro_rules! sigma {
+    ($round:expr, $index:expr) => {
+        BLAKE2B_SIGMA[$round][$index] as usize & 15
+    };
+}
+
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn blake_g(m: &[u64; 16], r: usize, i: usize, v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize) {
     v[a] = v[a]
         .wrapping_add(v[b])
-        .wrapping_add(m[BLAKE2B_SIGMA[r][2 * i] as usize]);
+        .wrapping_add(m[sigma!(r, 2 * i)]);
     v[d] = rotr64(v[d] ^ v[a], 32);
     v[c] = v[c].wrapping_add(v[d]);
     v[b] = rotr64(v[b] ^ v[c], 24);
     v[a] = v[a]
         .wrapping_add(v[b])
-        .wrapping_add(m[BLAKE2B_SIGMA[r][2 * i + 1] as usize]);
+        .wrapping_add(m[sigma!(r, 2 * i + 1)]);
     v[d] = rotr64(v[d] ^ v[a], 16);
     v[c] = v[c].wrapping_add(v[d]);
     v[b] = rotr64(v[b] ^ v[c], 63);
@@ -204,7 +264,7 @@ impl Blake2b {
             let have = self.buf_len as usize;
             let left = BLAKE2B_BLOCK_BYTES - have;
             for index in 0..left {
-                self.buf[have + index] = input.add(index).read();
+                self.buf[buf_slot!(have + index)] = input.add(index).read();
             }
 
             self.increment_counter(BLAKE2B_BLOCK_BYTES as u64);
@@ -223,7 +283,7 @@ impl Blake2b {
             }
         }
         for index in 0..input_len as usize {
-            self.buf[self.buf_len as usize + index] = input.add(index).read();
+            self.buf[buf_slot!(self.buf_len as usize + index)] = input.add(index).read();
         }
         self.buf_len += input_len;
     }
@@ -340,6 +400,7 @@ unsafe fn initial_hash(
     blake.finalize(out, ARGON2_PREHASH_DIGEST_LENGTH as u32);
 }
 
+gpu_kernel! {
 /// `argon2_first_blocks_kernel`: derives blocks 0 and 1 of every job in the batch.
 ///
 /// The argument order is *not* the C++ kernel's. It is regrouped — pointers, then the 64-bit
@@ -351,9 +412,8 @@ unsafe fn initial_hash(
 /// # Safety
 /// `memory` must hold `batch_size` jobs of `4 * segment_blocks` 1 KiB blocks, `keys`
 /// `batch_size * key_length` bytes and `salt` `salt_length` bytes, all device-resident.
-#[no_mangle]
 #[allow(clippy::too_many_arguments)]
-pub unsafe extern "gpu-kernel" fn argon2_first_blocks_kernel(
+fn argon2_first_blocks_kernel(
     memory: *mut u8,
     keys: *const u8,
     salt: *const u8,
@@ -414,6 +474,7 @@ pub unsafe extern "gpu-kernel" fn argon2_first_blocks_kernel(
         ARGON2_PREHASH_SEED_LENGTH as u32,
     );
 }
+}
 
 // ---------------------------------------------------------------- stage 2: the one-shot
 //
@@ -428,36 +489,7 @@ pub unsafe extern "gpu-kernel" fn argon2_first_blocks_kernel(
 // scratch is a `BlockTh` in registers, which is the shape `move_block`/`xor_block` already
 // have, and rustc's amdgcn target cannot express `addrspace(3)` globals anyway.
 
-const THREADS_PER_LANE: u32 = 32;
 const QWORDS_IN_BLOCK: usize = ARGON2_BLOCK_SIZE / 8;
-
-extern "C" {
-    #[link_name = "llvm.amdgcn.mbcnt.lo"]
-    fn mbcnt_lo(mask: u32, base: u32) -> u32;
-    #[link_name = "llvm.amdgcn.mbcnt.hi"]
-    fn mbcnt_hi(mask: u32, base: u32) -> u32;
-    #[link_name = "llvm.amdgcn.ds.bpermute"]
-    fn ds_bpermute(byte_index: u32, src: u32) -> u32;
-}
-
-/// This work-item's index inside its wavefront.
-#[inline(always)]
-fn lane_id() -> u32 {
-    // SAFETY: both intrinsics are pure reads of the lane-mask registers.
-    unsafe { mbcnt_hi(!0, mbcnt_lo(!0, 0)) }
-}
-
-/// `TM_SHFL` for a 32-bit value: read `value` from lane `src` of this work-item's *group of
-/// 32*. `ds_bpermute` addresses the whole wavefront, so the group base is put back — on a
-/// wave64 part lanes 32..63 must read from their own half, exactly as HIP's `__shfl(...,
-/// THREADS_PER_LANE)` does.
-#[inline(always)]
-fn shfl32(value: u32, src: u32) -> u32 {
-    let lane = (lane_id() & !(THREADS_PER_LANE - 1)) | (src & (THREADS_PER_LANE - 1));
-    // SAFETY: `ds_bpermute` is a cross-lane register read; the byte index is a lane number
-    // scaled by 4, which is the intrinsic's documented encoding.
-    unsafe { ds_bpermute(lane << 2, value) }
-}
 
 /// `u64_shuffle`: two 32-bit shuffles, like the C++.
 #[inline(always)]
@@ -467,11 +499,12 @@ fn shfl64(value: u64, src: u32) -> u64 {
     (u64::from(hi) << 32) | u64::from(lo)
 }
 
-/// `TM_SHFL_XOR`. For masks below 32 — the only ones used — this is the same lane the HIP
-/// builtin picks, because the group base is restored by [`shfl32`].
+/// `TM_SHFL_XOR` for a 64-bit value: two 32-bit xor-shuffles, like [`shfl64`].
 #[inline(always)]
 fn shfl_xor64(value: u64, mask: u32) -> u64 {
-    shfl64(value, lane_id() ^ mask)
+    let lo = shfl_xor32(value as u32, mask);
+    let hi = shfl_xor32((value >> 32) as u32, mask);
+    (u64::from(hi) << 32) | u64::from(lo)
 }
 
 /// `struct block_th`: this work-item's quarter of the Argon2 block.
@@ -845,6 +878,7 @@ unsafe fn argon2_step_dependent(
     argon2_core(memory, mem_curr, prev, thread, ref_index);
 }
 
+gpu_kernel! {
 /// `argon2_kernel_oneshot`: fills blocks 2.. of every job's lane, one pass, one lane.
 ///
 /// Launched as one workgroup of `THREADS_PER_LANE` work-items per job, exactly like the HIP
@@ -854,8 +888,7 @@ unsafe fn argon2_step_dependent(
 /// # Safety
 /// `memory` must hold one job per workgroup of `4 * segment_blocks` 1 KiB blocks, with
 /// blocks 0 and 1 of each already filled.
-#[no_mangle]
-pub unsafe extern "gpu-kernel" fn argon2_kernel_oneshot(memory: *mut u64, segment_blocks: u32) {
+fn argon2_kernel_oneshot(memory: *mut u64, segment_blocks: u32) {
     let job_id = workgroup_id_x() as usize;
     let thread = workitem_id_x();
 
@@ -931,4 +964,5 @@ pub unsafe extern "gpu-kernel" fn argon2_kernel_oneshot(memory: *mut u64, segmen
             mem_curr = mem_curr.add(QWORDS_IN_BLOCK);
         }
     }
+}
 }

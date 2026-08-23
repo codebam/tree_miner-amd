@@ -17,7 +17,7 @@ use clap::Parser;
     name = "treeminer",
     about = "XenblocksMiner options",
     disable_version_flag = true,
-    // boost accepted `--cudaStreams -1`; without this clap reads `-1` as an unknown short
+    // boost accepted `--gpuStreams -1`; without this clap reads `-1` as an unknown short
     // flag and reports a parse error instead of the C++'s bounds message.
     allow_negative_numbers = true
 )]
@@ -98,9 +98,13 @@ pub struct Cli {
     #[arg(long = "journalPath", value_name = "string")]
     pub journal_path: Option<String>,
 
-    /// independent CUDA work streams per device (1-2)
-    #[arg(long = "cudaStreams", value_name = "int")]
-    pub cuda_streams: Option<i32>,
+    /// independent GPU work streams per device (1-2)
+    //
+    // `--cudaStreams` is the C++ miner's name for this flag and is kept as a hidden alias
+    // so field deployments keep working; it is not advertised, because the streams are HIP
+    // queues on AMD hardware.
+    #[arg(long = "gpuStreams", alias = "cudaStreams", value_name = "int")]
+    pub gpu_streams: Option<i32>,
 
     /// independent CPU sidecar mining workers (0 disables)
     #[arg(long = "cpuWorkers", value_name = "int")]

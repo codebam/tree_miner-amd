@@ -1,5 +1,36 @@
 # Rust port of TreeMiner — working rules
 
+## Vendor support matrix
+
+| vendor | build | status |
+| --- | --- | --- |
+| **AMD** (HIP/ROCm, `amdgcn`) | `cargo build` (default, `--features amd`) | **Tested** on an RX 7900 XTX (gfx1100, ROCm 7.2): 44/44 fixture vectors byte-exact with GPU first blocks on *and* off, raw-block differential against the hipcc kernels green, ~1.5x the HIP kernel's hashrate. |
+| **NVIDIA** (CUDA/PTX, `nvptx64`) | `cargo build --no-default-features --features nvidia` | **Compiles. Never executed.** There is no NVIDIA GPU on the machine it was written on. Not one digest has come out of it. |
+
+The two features are mutually exclusive: they link different device runtimes, and enabling
+both is a `compile_error!`.
+
+**What "never executed" means.** The NVIDIA path has been verified only in the ways that do
+not need a device: the kernel crate compiles for `nvptx64-nvidia-cuda`, the emitted PTX
+contains both `.visible .entry` kernels, it is self-contained (no `.extern .func` for the
+JIT to fail on), every `shfl.sync` is a full-warp width-32 shuffle, the host's argument list
+matches the `.param` list the PTX declares, and the CUDA driver-API host layer compiles.
+Nothing above tells you the kernels compute Argon2 correctly on an NVIDIA card — an invalid
+digest is accepted locally and rejected by the server after the work is spent, which is the
+exact failure mode commit 12e241c is about.
+
+**If you are the first person to run this on an NVIDIA card**, before trusting a single
+submission:
+
+```sh
+cargo test -p tm-gpu --no-default-features --features nvidia   # fixtures + self-test, on the card
+tests/parity/run_parity.sh                                      # against the C++ miner
+```
+
+The fixture suite (`fixtures/argon2_vectors.json`, 44 vectors, both first-block paths) is
+the acceptance gate. Until it passes on real hardware, treat the NVIDIA build as a
+compilation exercise.
+
 The C++/HIP miner lives at `../treeminer` in this same worktree. This workspace is a
 rewrite of its **host code** in Rust. Read the C++ file named in your brief before porting;
 behaviour must match unless the brief says otherwise, because the two are cross-checked
@@ -90,7 +121,51 @@ The device kernels are being moved to Rust one at a time. `crates/tm-kernel/` ho
 | `argon2_first_blocks_kernel` | yes | stage 1 |
 | `argon2_kernel_oneshot` | yes | stage 2 — the shuffle-heavy one |
 
-### The feature flag
+### The vendor abstraction
+
+The Argon2 arithmetic in `crates/tm-kernel/src/lib.rs` is written once. Everything that
+differs between the two GPUs lives in `crates/tm-kernel/src/arch/`, one module per target:
+
+| | AMD (`arch/amd.rs`) | NVIDIA (`arch/nvidia.rs`) |
+| --- | --- | --- |
+| thread / block id | `llvm.amdgcn.workitem.id.x` / `workgroup.id.x` | `llvm.nvvm.read.ptx.sreg.tid.x` / `ctaid.x` |
+| `__shfl_sync(m, v, src, 32)` | `llvm.amdgcn.ds.bpermute`, **byte** lane index, absolute lane rebuilt as `(lane_id() & !31) | (src & 31)` so wave64 halves stay separate | `llvm.nvvm.shfl.sync.idx.i32(0xffffffff, v, src & 31, 0x1f)` |
+| `__shfl_xor_sync(m, v, mask, 32)` | the same `bpermute`, lane `lane_id() ^ mask` | `llvm.nvvm.shfl.sync.bfly.i32(0xffffffff, v, mask, 0x1f)` — the xor-shuffle is one instruction there |
+| kernel entry ABI | `extern "gpu-kernel"` | `extern "ptx-kernel"` |
+
+An ABI string cannot be produced by `cfg_attr`, so `arch::gpu_kernel!` generates the whole
+item instead; the kernel bodies are passed through untouched.
+
+Two masks in the shared code are also vendor-conditional, and both exist for the same
+reason: LLVM does not unroll the Blake2b round loop for nvptx64, so an index it could prove
+in range on amdgcn becomes a bounds check, and a bounds check is a call to
+`core::panicking::panic_bounds_check` — an `.extern .func` that no PTX module can resolve.
+`sigma!` masks the Blake2b sigma lookup with `& 15`; `buf_slot!` masks the Blake2b buffer
+index with `& 127`. Both are no-ops on any in-range value. They are written as macros, not
+functions, so that **the amdgcn arm is literally the token stream the kernel had before
+NVIDIA existed** — which is what keeps the AMD code object byte for byte identical.
+
+> Worth knowing: applying `sigma!`'s mask on amdgcn *as well* takes
+> `argon2_first_blocks_kernel` from 249 SGPR + 11 VGPR spills and 192 VGPRs down to zero
+> spills and 128 VGPRs (measured). `argon2_kernel_oneshot` is unaffected. That is a real
+> improvement, and it should be taken deliberately with the fixture suite re-run — not as a
+> side effect of adding a second vendor, which is why it is not taken here.
+
+### The vendor features
+
+`tm-gpu/Cargo.toml` has `amd` (default) and `nvidia`, mutually exclusive. `amd` implies the
+`rust-kernel` and `hip-kernel` flags described below. `treeminer` forwards both features
+through to `tm-gpu`.
+
+On the host side the abstraction is one line: `tm-gpu/src/lib.rs` aliases `driver` to either
+`hip` or `cuda`, and those two modules expose the same names and signatures (`DeviceBuffer`,
+`Stream`, `Event`, `memcpy_2d_async`, `launch_oneshot`, `launch_first_blocks`). `runner.rs`,
+`device.rs`, `hash.rs` and `backend.rs` are vendor-agnostic. `backend.rs` picks
+`GpuRuntimeKind::Cuda` or `::Hip` for `tm_core`'s batch sizing by the same feature, which
+matters: ROCm serves an over-large allocation out of host memory instead of failing it, so
+the HIP arm carries a 1 GiB reserve floor that CUDA does not need.
+
+### The rust-kernel flag
 
 `tm-gpu/Cargo.toml` gains `rust-kernel`, **off by default**. With it on, `hip::launch_first_blocks`
 and `hip::launch_oneshot` dispatch to `module::*` (the Rust kernels) instead of the hipcc ones;
@@ -102,6 +177,32 @@ a Rust kernel is unproven.
 ./rs cargo test -p tm-gpu --features rust-kernel   # Rust first blocks, on the real GPU
 ./rs cargo test --workspace                        # unchanged: HIP everywhere
 ```
+
+### How the NVIDIA build works
+
+Same crate, same `-Zbuild-std=core` sysroot trick, three differences:
+
+- **`--crate-type=rlib` plus `--emit=asm` instead of a link.** rustc links `nvptx64` with
+  `llvm-bitcode-linker`, which the nix rustc does not ship and rustup only offers as a
+  nightly component. Emitting the assembly of a single codegen unit sidesteps it: the
+  assembly *is* PTX. This is only sound because the kernel crate is self-contained — the
+  `ptx_is_self_contained` test in `tm-gpu/src/cuda/module.rs` is what notices if it stops
+  being.
+- **`-Ctarget-cpu` is left at the target default, `sm_70`.** It is also the lowest value
+  this rustc accepts for nvptx64, so **anything older than Volta cannot be targeted at all**
+  — no Pascal, no GTX 10-series, no P106 mining cards. That rules out a large part of the
+  installed XenBlocks base and is the single biggest practical limitation of this path.
+- **No lld, no ROCm.** The nvidia build needs no HIP toolchain at all.
+
+The PTX is embedded with `include_str!` and handed to `cuModuleLoadData`, which JITs it for
+whatever card is present — so unlike the AMD code object it is not tied to one architecture.
+
+`libcuda` is located by `build.rs` (`TM_CUDA_LIB_DIR`, then `$CUDA_PATH/lib64[/stubs]`, then
+the usual system directories; the CUDA toolkit's `stubs/libcuda.so` is enough to link).
+Not finding it is a **hard build failure with an explanatory message**, not a late `-lcuda`
+from the linker. `TM_CUDA_ALLOW_MISSING=1` downgrades that to a warning so the NVIDIA path
+can be compile-checked on a machine with no CUDA — which is the only way it has ever been
+built. The resulting rlib cannot be linked into anything.
 
 ### How it is built
 
@@ -159,7 +260,10 @@ GPU-only ABI), and keeping it out means `cargo test --workspace` never sees it. 
 
 ### The acceptance gate
 
-Both must pass on real hardware before a Rust kernel is believed:
+Both must pass on real hardware before a Rust kernel is believed. **On NVIDIA, neither has
+ever been run.** The differential in particular has no NVIDIA counterpart at all: there is no
+hipcc oracle for that target, so the fixture vectors and the parity script are the only
+checks that exist.
 
 1. `fixtures/argon2_vectors.json` (44 vectors) reproduces byte for byte with the feature on —
    `tests/gpu_vectors.rs`, which runs every vector through *both* first-block paths.
@@ -186,5 +290,12 @@ index becomes an indexed local array, which on AMDGPU means scratch.
 - The kernarg layout is an ABI contract between `tm-kernel` and `tm-gpu/src/module.rs` that
   the compiler cannot check across the two builds. `debug_assert_eq!(size_of::<…>(), 72)`
   catches a size change; only the differential test catches a reordering.
-- The generated code object is single-architecture. Cross-machine deployment needs either a
-  per-arch build or a fat bundle; the HIP kernel is still fat.
+- The generated amdgcn code object is single-architecture. Cross-machine deployment needs
+  either a per-arch build or a fat bundle; the HIP kernel is still fat. The PTX does not have
+  this problem — the driver JITs it — but it does have the `sm_70` floor.
+- `abi_ptx` is a second unstable ABI feature with the same upgrade risk as `abi_gpu_kernel`.
+- The NVIDIA build's freedom from `.extern .func` is an emergent property of how LLVM
+  optimises this particular source, not a guarantee. `ptx_is_self_contained` is the guard.
+- `CUDA_MEMCPY2D` is the one CUDA struct declared by hand in `src/cuda.rs`. Its `_v2` layout
+  is fixed by the driver's versioning scheme, which is the only reason that is defensible —
+  and it has never been exercised.

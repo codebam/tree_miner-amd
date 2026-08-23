@@ -1,17 +1,32 @@
 #!/usr/bin/env bash
-# Toolchain wrapper: this box has no global rust/hip, both come from nix.
+# Toolchain wrapper for the Rust tree.
+#
+# Everything (Rust, ROCm, the amdgcn sysroot source) comes from nix. Inside `nix develop`
+# the flake exports the paths and this is a thin passthrough; outside it, each one is
+# resolved with `nix build` so a bare checkout still works. Nothing is hardcoded to a
+# /nix/store path — those do not survive garbage collection or move between machines.
+#
 # Usage: ./rs cargo test -p tm-core
 set -euo pipefail
-CLR=/nix/store/95lwwwfb3alzn7pk9ky55fbbflaxarb5-clr-7.2.3
-DEVLIBS=/nix/store/8jdkas7zs4yzqs0n3xrrnnmc9s3xx5zb-rocm-device-libs-22.0.0-rocm
-SMI=/nix/store/bz2lfkmiydg5h8l70w1r3959kv7c7vpr-rocm-smi-7.2.3
-# `-Z build-std=core` needs the standard-library *source*, which the nix rustc does not
-# ship. This is `nix build nixpkgs#rustPlatform.rustLibSrc` for the same nixpkgs the rustc
-# below comes from; tm-gpu's build.rs falls back to running that itself if it is unset.
-LIBSRC=/nix/store/hd4a7m5ajkxcywxwvxxkcwjvdnyyc0gn-rust-lib-src
-export ROCM_PATH="$CLR" HIP_PATH="$CLR"
-export HIP_DEVICE_LIB_PATH="$DEVLIBS/amdgcn/bitcode"
-export TM_ROCM_SMI_PATH="$SMI"
-export TM_RUST_LIB_SRC="$LIBSRC"
-export PATH="$CLR/bin:$PATH"
-exec nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#clippy nixpkgs#rustfmt nixpkgs#gcc nixpkgs#pkg-config nixpkgs#openssl --command "$@"
+
+resolve() { # attribute -> store path, cached in the environment for repeat calls
+    nix build --no-link --print-out-paths "nixpkgs#$1"
+}
+
+: "${ROCM_PATH:=$(resolve rocmPackages.clr)}"
+: "${TM_ROCM_DEVICE_LIBS:=$(resolve rocmPackages.rocm-device-libs)}"
+: "${TM_ROCM_SMI_PATH:=$(resolve rocmPackages.rocm-smi)}"
+: "${TM_RUST_LIB_SRC:=$(resolve rustPlatform.rustLibSrc)}"
+
+export ROCM_PATH TM_ROCM_DEVICE_LIBS TM_ROCM_SMI_PATH TM_RUST_LIB_SRC
+export HIP_PATH="$ROCM_PATH"
+export HIP_DEVICE_LIB_PATH="$TM_ROCM_DEVICE_LIBS/amdgcn/bitcode"
+export PATH="$ROCM_PATH/bin:$PATH"
+
+# Already inside the dev shell? Then cargo and friends are on PATH; do not nest.
+if [ -n "${IN_NIX_SHELL:-}" ] || command -v cargo >/dev/null 2>&1; then
+    exec "$@"
+fi
+
+exec nix shell nixpkgs#cargo nixpkgs#rustc nixpkgs#clippy nixpkgs#rustfmt \
+    nixpkgs#gcc nixpkgs#pkg-config nixpkgs#openssl --command "$@"

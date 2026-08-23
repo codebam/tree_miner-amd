@@ -15,6 +15,13 @@ use tm_gpu::{
 
 use crate::selftest::{ProbeOutcome, SelfTestProbe, SELF_TEST_DIFFICULTY, SELF_TEST_KEY, SELF_TEST_PATTERN, SELF_TEST_SALT};
 
+/// Which runtime `tm_core` should size batches for; follows the vendor `tm-gpu` was built
+/// with. ROCm needs a much larger VRAM cushion than CUDA — see `tm_core::batch`.
+#[cfg(feature = "amd")]
+const RUNTIME: GpuRuntimeKind = GpuRuntimeKind::Hip;
+#[cfg(feature = "nvidia")]
+const RUNTIME: GpuRuntimeKind = GpuRuntimeKind::Cuda;
+
 /// Headroom left on a device whose memory is shared between streams, so a second stream's
 /// allocation does not have to come out of the first one's slack. Port of the
 /// `kDeviceHeadroom` constant in `MineUnit::runMineLoop`.
@@ -123,7 +130,7 @@ impl MiningBackend for GpuMiningBackend {
             .saturating_sub(DEVICE_HEADROOM_BYTES);
         let share = shareable / streams_per_device;
         Ok(select_batch_size(
-            GpuRuntimeKind::Hip,
+            RUNTIME,
             free.min(share),
             difficulty,
             explicit_max_batch_size,

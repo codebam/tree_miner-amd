@@ -140,9 +140,13 @@ pub fn load_vectors() -> Vec<Vector> {
 }
 
 /// Returns the first GPU, or `None` after printing why the test is being skipped.
+///
+/// A skip is a *hole in the evidence*, not a pass. On the `nvidia` build that hole is the
+/// whole story so far — no NVIDIA GPU has ever run these kernels — so the skip says so
+/// rather than scrolling past as an "ok".
 pub fn first_gpu_or_skip(test: &str) -> Option<tm_gpu::Device> {
-    match tm_gpu::Device::enumerate() {
-        Ok(devices) if !devices.is_empty() => devices.into_iter().next(),
+    let device = match tm_gpu::Device::enumerate() {
+        Ok(devices) if !devices.is_empty() => return devices.into_iter().next(),
         Ok(_) => {
             eprintln!("skipping {test}: no GPU present");
             None
@@ -151,7 +155,16 @@ pub fn first_gpu_or_skip(test: &str) -> Option<tm_gpu::Device> {
             eprintln!("skipping {test}: GPU unavailable ({error})");
             None
         }
-    }
+    };
+    #[cfg(feature = "nvidia")]
+    eprintln!(
+        "  NOTE: this is the `nvidia` build, and it has never been executed on a GPU. \
+         {test} did not run, so it proves nothing about the CUDA path. Run the full \
+         `cargo test -p tm-gpu --no-default-features --features nvidia` suite and \
+         tests/parity/run_parity.sh on a real NVIDIA card before trusting a submission \
+         from it."
+    );
+    device
 }
 
 /// Serialises the GPU tests inside one test binary. The card is shared with whatever else

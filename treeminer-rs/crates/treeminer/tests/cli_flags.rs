@@ -52,7 +52,7 @@ fn every_option_from_the_cpp_block_is_present() {
         "7000",
         "--journalPath",
         "/var/lib/treeminer.db",
-        "--cudaStreams",
+        "--gpuStreams",
         "2",
         "--cpuWorkers",
         "4",
@@ -85,7 +85,7 @@ fn every_option_from_the_cpp_block_is_present() {
     assert_eq!(cli.difficulty_margin, Some(1500));
     assert_eq!(cli.difficulty_margin_max, Some(7000));
     assert_eq!(cli.journal_path.as_deref(), Some("/var/lib/treeminer.db"));
-    assert_eq!(cli.cuda_streams, Some(2));
+    assert_eq!(cli.gpu_streams, Some(2));
     assert_eq!(cli.cpu_workers, Some(4));
     assert_eq!(cli.cpu_max_difficulty, Some(250));
     assert_eq!(cli.dashboard_bind.as_deref(), Some("127.0.0.1"));
@@ -110,7 +110,7 @@ fn equals_and_space_forms_are_both_accepted() {
     assert_eq!(parse(&["--device=1,2,7"]).device.as_deref(), Some("1,2,7"));
     assert_eq!(parse(&["--device", "1,2,7"]).device.as_deref(), Some("1,2,7"));
     assert_eq!(parse(&["--dashboard-port=8080"]).dashboard_port, Some(8080));
-    assert_eq!(parse(&["--cudaStreams=2"]).cuda_streams, Some(2));
+    assert_eq!(parse(&["--gpuStreams=2"]).gpu_streams, Some(2));
 }
 
 /// A comma list must stay one value; splitting it would silently drop devices.
@@ -121,7 +121,7 @@ fn device_list_is_not_split_on_commas() {
 
 #[test]
 fn integer_options_reject_non_numbers() {
-    assert!(fails(&["--cudaStreams", "two"]).contains("two"));
+    assert!(fails(&["--gpuStreams", "two"]).contains("two"));
     assert!(fails(&["--dashboard-port", "abc"]).contains("abc"));
     assert!(fails(&["--totalDevFee", "x"]).contains("x"));
 }
@@ -129,7 +129,7 @@ fn integer_options_reject_non_numbers() {
 #[test]
 fn negative_integers_parse_so_resolution_can_report_the_cpp_message() {
     assert_eq!(parse(&["--cpuWorkers=-1"]).cpu_workers, Some(-1));
-    assert_eq!(parse(&["--cudaStreams=-3"]).cuda_streams, Some(-3));
+    assert_eq!(parse(&["--gpuStreams=-3"]).gpu_streams, Some(-3));
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn help_lists_every_flag() {
         "--difficultyMargin",
         "--difficultyMarginMax",
         "--journalPath",
-        "--cudaStreams",
+        "--gpuStreams",
         "--cpuWorkers",
         "--cpuMaxDifficulty",
         "--dashboard-bind",
@@ -179,4 +179,29 @@ fn help_lists_every_flag() {
     ] {
         assert!(help.contains(flag), "missing {flag} in --help");
     }
+}
+
+// ------------------------------------------------------- vendor-neutral stream spelling
+
+/// `--gpuStreams` is the spelling operators should see; `--cudaStreams` is what the C++
+/// miner called it and what every deployed unit file passes today.
+#[test]
+fn both_stream_spellings_parse_to_the_same_field() {
+    assert_eq!(parse(&["--gpuStreams", "2"]).gpu_streams, Some(2));
+    assert_eq!(parse(&["--cudaStreams", "2"]).gpu_streams, Some(2));
+    assert_eq!(parse(&["--cudaStreams=1"]).gpu_streams, Some(1));
+}
+
+/// The alias must not be advertised: the kernels are HIP, and help text that names CUDA
+/// tells the operator they are on hardware they are not on.
+#[test]
+fn the_cuda_stream_alias_is_hidden_from_help() {
+    let mut buffer = Vec::new();
+    <Cli as clap::CommandFactory>::command()
+        .write_help(&mut buffer)
+        .expect("help");
+    let help = String::from_utf8(buffer).expect("utf8");
+    assert!(help.contains("--gpuStreams"));
+    assert!(!help.contains("cudaStreams"), "the alias leaked into --help");
+    assert!(!help.contains("CUDA"), "help text still names CUDA");
 }

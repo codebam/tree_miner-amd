@@ -1,11 +1,27 @@
-//! The GPU layer of TreeMiner: HIP device management, the Argon2 batch pool, and the hash
+//! The GPU layer of TreeMiner: device management, the Argon2 batch pool, and the hash
 //! backend the mining loop drives.
+//!
+//! # Vendor support
+//!
+//! | vendor | feature | status |
+//! | --- | --- | --- |
+//! | AMD (HIP/ROCm) | `amd`, the default | **tested** on gfx1100: 44/44 fixture vectors byte-exact, raw-block differential against the hipcc kernels green |
+//! | NVIDIA (CUDA/PTX) | `nvidia` | **compiles; never executed.** No NVIDIA GPU has ever run it |
+//!
+//! The two features are mutually exclusive — they link different device runtimes — so the
+//! NVIDIA build is `--no-default-features --features nvidia`. Everything above the driver
+//! layer is shared: `runner.rs`, `device.rs`, `hash.rs` and `backend.rs` talk to
+//! [`driver`], which is [`hip`] or [`cuda`] depending on the feature, and the Argon2
+//! kernels themselves are one Rust source (`../tm-kernel`) built for two targets.
+//!
+//! The NVIDIA path is honest about what it is: it is compile-verified, its PTX has been
+//! read, and its argument packing is unit-tested against the kernel signature the PTX
+//! declares — but no digest has ever come out of it. The first person with an NVIDIA card
+//! should run `tests/parity/run_parity.sh` and the fixture suite before trusting a
+//! submission from it. See PORT.md.
 //!
 //! Port of `src/kernelrunner.cu` (host half), `src/CudaBackend.cpp`, `src/CudaDevice.cpp`,
 //! `src/ComputeBackend.h`, `src/gpu/GpuTelemetry.cpp` and `src/hashapi/CudaHashBackend.cpp`.
-//! The Argon2 *device* kernels stay in C++ (`kernel/argon2_kernel.hip`, compiled by
-//! `build.rs`) and are reached through a two-function `extern "C"` shim — see `PORT.md` for
-//! why rewriting them is a separate, later phase.
 //!
 //! This is the only crate in the workspace allowed to use `unsafe`.
 //!
@@ -23,13 +39,39 @@
 //! # }
 //! ```
 
+#[cfg(all(feature = "amd", feature = "nvidia"))]
+compile_error!(
+    "tm-gpu's `amd` and `nvidia` features are mutually exclusive: they link different device \
+     runtimes. Use `--no-default-features --features nvidia` for the (untested) NVIDIA path."
+);
+#[cfg(not(any(feature = "amd", feature = "nvidia")))]
+compile_error!(
+    "tm-gpu needs a vendor feature: `amd` (the default, tested) or `nvidia` (compile-verified \
+     only, never run on hardware)."
+);
+
 pub mod backend;
+#[cfg(feature = "nvidia")]
+mod cuda;
 pub mod device;
 pub mod error;
+#[cfg(feature = "amd")]
 mod hip;
 pub mod hash;
-#[cfg(feature = "rust-kernel")]
+#[cfg(all(feature = "amd", feature = "rust-kernel"))]
 mod module;
+
+/// The device runtime everything above this layer talks to.
+///
+/// `hip` and `cuda` deliberately expose the same names and signatures — `DeviceBuffer`,
+/// `Stream`, `Event`, `memcpy_2d_async`, `launch_oneshot`, `launch_first_blocks` — so this
+/// alias is the whole of the vendor abstraction on the host side. A call that exists on only
+/// one of them (`launch_oneshot_hip`, the differential oracle) is reached through a cfg at
+/// the call site, not smuggled in here.
+#[cfg(feature = "amd")]
+use hip as driver;
+#[cfg(feature = "nvidia")]
+use cuda as driver;
 pub mod params;
 pub mod runner;
 pub mod telemetry;

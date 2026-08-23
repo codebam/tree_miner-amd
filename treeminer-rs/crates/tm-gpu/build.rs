@@ -1,4 +1,12 @@
-//! Compiles the Argon2 device kernels with `hipcc` and links them into the crate.
+//! Builds the Argon2 device kernels and links the vendor runtime.
+//!
+//! Two mutually exclusive shapes, chosen by feature:
+//!
+//! - `amd` (default, **tested**): `hipcc` compiles `kernel/argon2_kernel.hip`, and the Rust
+//!   kernels in `../tm-kernel` are compiled for `amdgcn-amd-amdhsa`. Links `libamdhip64`.
+//! - `nvidia` (**never executed — no NVIDIA GPU exists on the machine this was written on**):
+//!   the same Rust kernels are compiled for `nvptx64-nvidia-cuda` and emitted as PTX, and the
+//!   crate links the CUDA driver library. No `hipcc`, no C++.
 //!
 //! The kernel is the only C++ left in the miner (see `PORT.md`), so this is the only place
 //! that needs a GPU toolchain. When `hipcc` cannot be found the build still succeeds and
@@ -21,6 +29,18 @@ fn main() {
     println!("cargo:rerun-if-env-changed=TM_GPU_OFFLOAD_ARCH");
     println!("cargo:rerun-if-env-changed=ROCM_PATH");
     println!("cargo:rerun-if-env-changed=HIP_PATH");
+
+    let nvidia = std::env::var_os("CARGO_FEATURE_NVIDIA").is_some();
+    let amd = std::env::var_os("CARGO_FEATURE_AMD").is_some();
+    assert!(
+        !(nvidia && amd),
+        "tm-gpu's `amd` and `nvidia` features are mutually exclusive: they select different \
+         device runtimes to link. Build with `--no-default-features --features nvidia`."
+    );
+    if nvidia {
+        nvidia::main();
+        return;
+    }
 
     let rocm = rocm_path();
 
@@ -61,7 +81,7 @@ fn main() {
         // hipModuleLoad wants a code object for exactly one architecture, so the Rust
         // kernel is built for the first arch the HIP kernel is being fattened with.
         let arch = archs.first().expect("offload_archs is never empty");
-        rust_kernel::build(rocm.as_deref(), arch);
+        gpu_kernel::build_amdgcn(rocm.as_deref(), arch);
     }
 
     let archive = out_dir.join("libtm_argon2_kernel.a");
@@ -160,11 +180,12 @@ fn detect_archs(rocm: Option<&str>, tool: &str) -> Option<Vec<String>> {
 // Build scripts do not see feature cfgs, only `CARGO_FEATURE_*`; `main` calls this only
 // when `rust-kernel` is enabled.
 #[allow(dead_code)]
-mod rust_kernel {
+mod gpu_kernel {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    pub fn build(rocm: Option<&str>, arch: &str) {
+    /// `../tm-kernel/Cargo.toml`, with the rebuild triggers registered.
+    fn kernel_manifest() -> PathBuf {
         let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("set by cargo"))
             .join("../tm-kernel/Cargo.toml")
             .canonicalize()
@@ -173,6 +194,27 @@ mod rust_kernel {
         println!("cargo:rerun-if-changed={}", manifest.display());
         println!("cargo:rerun-if-changed={}", kernel_dir.join("src").display());
         println!("cargo:rerun-if-env-changed=TM_RUST_LIB_SRC");
+        manifest
+    }
+
+    /// Strips the outer build's settings out of a cargo invocation for a different target:
+    /// host rustflags, clippy's wrapper, the workspace target dir would all leak otherwise.
+    fn unleak(command: &mut Command) {
+        for leaked in [
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_BUILD_TARGET",
+            "CARGO_BUILD_RUSTFLAGS",
+            "CARGO_BUILD_TARGET_DIR",
+        ] {
+            command.env_remove(leaked);
+        }
+    }
+
+    /// Builds `../tm-kernel` for `amdgcn-amd-amdhsa`. This is the tested path.
+    pub fn build_amdgcn(rocm: Option<&str>, arch: &str) {
+        let manifest = kernel_manifest();
         println!("cargo:rerun-if-env-changed=TM_GPU_LLD");
 
         let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
@@ -201,18 +243,7 @@ mod rust_kernel {
                     lld.display()
                 ),
             );
-        // The outer build's settings would otherwise leak into a build for a completely
-        // different target: host rustflags, clippy's wrapper, the workspace target dir.
-        for leaked in [
-            "RUSTC_WRAPPER",
-            "RUSTC_WORKSPACE_WRAPPER",
-            "CARGO_ENCODED_RUSTFLAGS",
-            "CARGO_BUILD_TARGET",
-            "CARGO_BUILD_RUSTFLAGS",
-            "CARGO_BUILD_TARGET_DIR",
-        ] {
-            command.env_remove(leaked);
-        }
+        unleak(&mut command);
 
         let status = command
             .status()
@@ -225,6 +256,93 @@ mod rust_kernel {
             .expect("cargo emitted the amdgcn code object");
         println!("cargo:rustc-env=TM_RUST_KERNEL_ELF={}", elf.display());
         println!("cargo:rustc-env=TM_RUST_KERNEL_ARCH={arch}");
+    }
+
+    /// Builds `../tm-kernel` for `nvptx64-nvidia-cuda`, emits PTX, and points
+    /// `TM_PTX_KERNEL` at it. `src/cuda/module.rs` embeds that text and hands it to
+    /// `cuModuleLoadData`, which JITs it for whatever card is present.
+    ///
+    /// **This output has never been executed.** It is read, not run: see PORT.md.
+    ///
+    /// Two things differ from the amdgcn build beyond the target triple.
+    ///
+    /// `--crate-type=rlib` overrides the manifest's `cdylib`, and `--emit=asm` replaces the
+    /// link step. rustc links nvptx64 with `llvm-bitcode-linker`, which the nix rustc does
+    /// not ship (and rustup only offers as a nightly component); emitting the assembly of a
+    /// single codegen unit sidesteps it entirely. That is only sound because the kernel
+    /// crate is self-contained — every helper is `#[inline(always)]` or defined in the
+    /// crate, and the `sigma!` / `buf_slot!` masks in `tm-kernel` exist precisely so that
+    /// nothing calls out to `core`. If a future edit reintroduces an external call, the PTX
+    /// will carry an unresolved `.extern .func` and `cuModuleLoadData` will fail to JIT it;
+    /// `ptx_is_self_contained` in `src/cuda/module.rs` is the test that catches it first.
+    ///
+    /// `-Ctarget-cpu` is left at the target default, `sm_70`. It is also the *lowest* value
+    /// this rustc accepts for nvptx64, so anything older than Volta cannot be targeted at
+    /// all from here.
+    pub fn build_nvptx() {
+        let manifest = kernel_manifest();
+
+        let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
+        let sysroot = build_sysroot(&out_dir, &rustc);
+        let wrapper = write_rustc_wrapper(&out_dir, &rustc, &sysroot);
+
+        let target_dir = out_dir.join("ptx-target");
+        let mut command = Command::new("cargo");
+        command
+            .arg("rustc")
+            .arg("--release")
+            .arg("--manifest-path")
+            .arg(&manifest)
+            .arg("--target")
+            .arg("nvptx64-nvidia-cuda")
+            .arg("--crate-type=rlib")
+            .arg("-Zbuild-std=core")
+            .arg("--")
+            .arg("--emit=asm")
+            .arg("-Ccodegen-units=1")
+            .env("RUSTC_BOOTSTRAP", "1")
+            .env("RUSTC", &wrapper)
+            .env("CARGO_TARGET_DIR", &target_dir);
+        unleak(&mut command);
+
+        let status = command
+            .status()
+            .unwrap_or_else(|error| panic!("failed to run cargo for tm-kernel: {error}"));
+        assert!(status.success(), "building tm-kernel for nvptx64 failed");
+
+        let deps = target_dir.join("nvptx64-nvidia-cuda/release/deps");
+        let ptx = newest_asm(&deps);
+        let destination = out_dir.join("tm_kernel.ptx");
+        std::fs::copy(&ptx, &destination)
+            .unwrap_or_else(|error| panic!("copying {}: {error}", ptx.display()));
+        println!("cargo:rustc-env=TM_PTX_KERNEL={}", destination.display());
+    }
+
+    /// The `.s` rustc just wrote. `cargo rustc --emit=asm` names it after the crate *and* a
+    /// metadata hash, and leaves older ones behind, so it is picked by modification time.
+    fn newest_asm(deps: &Path) -> PathBuf {
+        let entries = std::fs::read_dir(deps)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", deps.display()));
+        let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "s") {
+                continue;
+            }
+            let Ok(modified) = entry.metadata().and_then(|meta| meta.modified()) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|(best, _)| modified >= *best) {
+                best = Some((modified, path));
+            }
+        }
+        best.map(|(_, path)| path).unwrap_or_else(|| {
+            panic!(
+                "cargo rustc --emit=asm produced no .s in {}",
+                deps.display()
+            )
+        })
     }
 
     /// A sysroot that is the real one plus `lib/rustlib/src/rust/library`, assembled from
@@ -403,5 +521,98 @@ mod rust_kernel {
 
     fn resolve(path: &Path) -> PathBuf {
         std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned())
+    }
+}
+
+/// The `nvidia` feature's half of the build.
+///
+/// **UNTESTED PATH.** Nothing here has ever run against a real CUDA installation: the
+/// machine this was written on has no NVIDIA GPU and no CUDA driver. It builds the PTX and
+/// arranges the link; whether the link is *correct* is unproven.
+#[allow(dead_code)]
+mod nvidia {
+    use std::path::{Path, PathBuf};
+
+    /// Where a CUDA driver library normally lives. The toolkit's `stubs/libcuda.so` is an
+    /// acceptable answer for linking — it exports the same symbols and the real driver is
+    /// resolved at load time — which is how CUDA programs are built on machines without a
+    /// GPU. On NixOS the driver is in `/run/opengl-driver/lib`.
+    const LIBCUDA_DIRS: &[&str] = &[
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib64",
+        "/usr/lib",
+        "/usr/local/cuda/lib64",
+        "/usr/local/cuda/lib64/stubs",
+        "/opt/cuda/lib64",
+        "/opt/cuda/lib64/stubs",
+        "/run/opengl-driver/lib",
+    ];
+
+    pub fn main() {
+        println!("cargo:rerun-if-env-changed=CUDA_PATH");
+        println!("cargo:rerun-if-env-changed=TM_CUDA_LIB_DIR");
+        println!("cargo:rerun-if-env-changed=TM_CUDA_ALLOW_MISSING");
+        println!("cargo:rerun-if-changed=build.rs");
+
+        super::gpu_kernel::build_nvptx();
+
+        match find_libcuda() {
+            Some(dir) => {
+                println!("cargo:rustc-link-search=native={}", dir.display());
+                // Test binaries are run directly rather than through a toolchain wrapper,
+                // so the search path has to survive into the runtime loader too — same
+                // reason the AMD path adds an rpath for ROCm.
+                println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
+            }
+            None => missing_libcuda(),
+        }
+        println!("cargo:rustc-link-lib=dylib=cuda");
+    }
+
+    /// `TM_CUDA_LIB_DIR`, then `CUDA_PATH`'s usual subdirectories, then [`LIBCUDA_DIRS`].
+    fn find_libcuda() -> Option<PathBuf> {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Some(configured) = std::env::var_os("TM_CUDA_LIB_DIR") {
+            roots.push(PathBuf::from(configured));
+        }
+        if let Some(cuda) = std::env::var_os("CUDA_PATH") {
+            let cuda = PathBuf::from(cuda);
+            roots.push(cuda.join("lib64"));
+            roots.push(cuda.join("lib64/stubs"));
+            roots.push(cuda.join("lib/x64"));
+        }
+        roots.extend(LIBCUDA_DIRS.iter().map(PathBuf::from));
+        roots
+            .into_iter()
+            .find(|dir| has_libcuda(dir))
+    }
+
+    fn has_libcuda(dir: &Path) -> bool {
+        ["libcuda.so", "libcuda.so.1", "cuda.lib"]
+            .iter()
+            .any(|name| dir.join(name).exists())
+    }
+
+    /// Refuse loudly. A missing driver library would otherwise show up much later as a bare
+    /// `cannot find -lcuda` from the linker, or — worse — as a `tm-gpu` that builds as a
+    /// library and only fails when someone tries to link the miner.
+    fn missing_libcuda() {
+        if std::env::var_os("TM_CUDA_ALLOW_MISSING").is_some() {
+            println!(
+                "cargo:warning=TM_CUDA_ALLOW_MISSING is set and no libcuda was found: tm-gpu \
+                 is compile-checking the NVIDIA path only. The library will build; linking \
+                 any binary or test against it will fail."
+            );
+            return;
+        }
+        panic!(
+            "tm-gpu's `nvidia` feature needs the CUDA driver library (libcuda.so) and none \
+             was found. Looked at TM_CUDA_LIB_DIR, $CUDA_PATH/lib64[/stubs], and {LIBCUDA_DIRS:?}. \
+             Install the NVIDIA driver or the CUDA toolkit (its lib64/stubs/libcuda.so is \
+             enough to link), or point TM_CUDA_LIB_DIR at the directory holding it. To \
+             compile-check the NVIDIA path on a machine with no CUDA at all — which is the \
+             only way it has ever been built — set TM_CUDA_ALLOW_MISSING=1; the resulting \
+             rlib cannot be linked into anything."
+        );
     }
 }

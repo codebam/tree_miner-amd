@@ -290,7 +290,7 @@ fn auto_batch_size_is_rejected_on_the_cpu_backend() {
     assert!(value["error"]
         .as_str()
         .expect("error is a string")
-        .contains("--backend cuda"));
+        .contains("--backend gpu"));
 }
 
 // -------------------------------------------------------------- the C++ JSON contract
@@ -366,7 +366,69 @@ fn the_json_keys_match_the_cpp_binary_on_failure() {
     assert_eq!(rust["error"], cpp["error"]);
 }
 
-// ---------------------------------------------------------------------- the cuda path
+// ------------------------------------------------------- vendor-neutral backend spelling
+
+/// `gpu` is the spelling the usage text advertises; `cuda` is the C++ miner's name for the
+/// same backend and stays accepted, because `tests/parity/run_parity.sh` drives both
+/// binaries with one command line.
+#[test]
+fn both_backend_spellings_parse_into_a_request() {
+    for backend in ["gpu", "cuda"] {
+        let request = base_request(&parse_args(&argv(&["hash-one", "--backend", backend])))
+            .expect("request parses");
+        assert_eq!(request.backend, backend);
+    }
+}
+
+#[test]
+fn the_usage_text_advertises_gpu_and_not_cuda() {
+    let (code, out, _) = run(&["hash-help"]);
+    assert_eq!(code, 0);
+    assert!(out.contains("--backend cpu|gpu"));
+    assert!(!out.to_lowercase().contains("cuda"), "usage still names CUDA");
+}
+
+/// A typo used to fall through to the CPU backend and silently hash for hours on the wrong
+/// device. It has to be a hard error that says what the valid values are.
+#[test]
+fn an_unknown_backend_is_rejected_by_name() {
+    let (code, value) = run_json(&[
+        "hash-one",
+        "--salt",
+        "e4bb184781bbc9c7004e8dafd4a9b49d203bc9bc",
+        "--backend",
+        "rocm",
+        "--json",
+    ]);
+    assert_eq!(code, 2);
+    let error = value["error"].as_str().expect("error is a string");
+    assert!(error.contains("rocm"), "{error}");
+    assert!(error.contains("cpu"), "{error}");
+    assert!(error.contains("gpu"), "{error}");
+    // The failure still carries the whole schema, like every other failed request.
+    assert!(value.get("timings").is_some());
+}
+
+/// `--auto-batch-size` needs a device; the message must name the flag the operator should
+/// have passed, in the spelling the help text uses.
+#[test]
+fn auto_batch_size_names_the_gpu_backend_in_its_error() {
+    let (code, value) = run_json(&[
+        "hash-batch",
+        "--salt",
+        "e4bb184781bbc9c7004e8dafd4a9b49d203bc9bc",
+        "--backend",
+        "cpu",
+        "--auto-batch-size",
+        "--json",
+    ]);
+    assert_eq!(code, 2);
+    let error = value["error"].as_str().expect("error is a string");
+    assert!(error.contains("--backend gpu"), "{error}");
+    assert!(!error.contains("cuda"), "{error}");
+}
+
+// ---------------------------------------------------------------------- the gpu path
 
 /// The GPU backend end to end through the CLI. Batches stay tiny: the card is shared with
 /// a live miner, so this is a correctness check, not a throughput one.
@@ -394,7 +456,7 @@ fn hash_one_on_the_gpu_reproduces_a_fixture_vector() {
     ]);
     assert_eq!(code, 0, "{}", value["error"]);
     assert_eq!(value["backend"], Value::String("cuda".to_owned()));
-    // The CUDA path reports the bare digest; the CPU path reports the whole PHC string.
+    // The GPU path reports the bare digest; the CPU path reports the whole PHC string.
     // That asymmetry is the C++ behaviour and the parity harness splits on `$` for it.
     assert!(
         vector.phc.ends_with(value["hash"].as_str().expect("hash is a string")),
@@ -430,4 +492,63 @@ fn hash_batch_on_the_gpu_runs_a_small_batch() {
     assert_eq!(value["attempts"], Value::from(8));
     assert_eq!(value["first_block_worker_count"], Value::from(4));
     assert_eq!(value["first_block_chunk_size"], Value::from(2));
+}
+
+/// The JSON `backend` field echoes the spelling that was asked for: the parity harness
+/// diffs it against the C++ miner, which only knows `cuda`.
+#[test]
+fn the_json_backend_field_echoes_the_requested_spelling() {
+    if !tm_gpu::gpu_available() {
+        eprintln!("skipping: no GPU present");
+        return;
+    }
+    let vector = load_vectors()
+        .into_iter()
+        .find(|vector| vector.difficulty == 8)
+        .expect("a difficulty-8 fixture");
+    let mut digests = Vec::new();
+    for backend in ["gpu", "cuda"] {
+        let (code, value) = run_json(&[
+            "hash-one",
+            "--salt",
+            &vector.salt_hex,
+            "--key",
+            &vector.key,
+            "--backend",
+            backend,
+            "--difficulty",
+            "8",
+            "--json",
+        ]);
+        assert_eq!(code, 0, "{}", value["error"]);
+        assert_eq!(value["backend"], Value::String(backend.to_owned()));
+        digests.push(value["hash"].clone());
+    }
+    assert_eq!(digests[0], digests[1], "the alias took a different path");
+}
+
+/// Without a device the two spellings still have to fail identically, and each has to say
+/// which backend was asked for.
+#[test]
+fn both_gpu_spellings_report_the_same_failure_shape() {
+    if tm_gpu::gpu_available() {
+        eprintln!("skipping: a GPU is present, so this path succeeds");
+        return;
+    }
+    for backend in ["gpu", "cuda"] {
+        let (code, value) = run_json(&[
+            "hash-one",
+            "--salt",
+            "e4bb184781bbc9c7004e8dafd4a9b49d203bc9bc",
+            "--key",
+            "52a13632690c0d5a7e528c91c8462f9d68d24975d4f80cc64d20504063f3590f",
+            "--backend",
+            backend,
+            "--difficulty",
+            "8",
+            "--json",
+        ]);
+        assert_eq!(code, 2);
+        assert_eq!(value["backend"], Value::String(backend.to_owned()));
+    }
 }

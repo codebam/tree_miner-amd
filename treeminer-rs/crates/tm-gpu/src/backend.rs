@@ -8,6 +8,18 @@ use crate::error::{GpuError, Result};
 use crate::params::Argon2Shape;
 use crate::runner::{KernelRunner, RunTimings};
 
+/// Which runtime `tm_core` should size batches for.
+///
+/// The distinction is not cosmetic: ROCm satisfies an over-large device allocation out of
+/// host memory instead of failing it, so the HIP arm carries a much larger VRAM cushion
+/// (`tm_core::batch`). CUDA fails the allocation honestly and needs only the default
+/// reserve. Selecting it by feature rather than by probing keeps the choice where the
+/// runtime is chosen.
+#[cfg(feature = "amd")]
+const RUNTIME: GpuRuntimeKind = GpuRuntimeKind::Hip;
+#[cfg(feature = "nvidia")]
+const RUNTIME: GpuRuntimeKind = GpuRuntimeKind::Cuda;
+
 /// A GPU backend. The pool is created lazily by [`GpuBackend::init`] and reused across
 /// batches whenever the shape allows.
 #[derive(Debug)]
@@ -77,7 +89,7 @@ impl GpuBackend {
         self.release_buffers();
         let free = self.free_memory_bytes()?;
         Ok(select_batch_size(
-            GpuRuntimeKind::Hip,
+            RUNTIME,
             free,
             difficulty,
             explicit_max_batch_size,

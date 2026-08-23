@@ -1,6 +1,9 @@
-//! Errors from the GPU layer. Every HIP call is checked; a non-zero `hipError_t` becomes a
-//! [`GpuError::Hip`] carrying the driver's own message, which is what the C++ miner's
-//! `CudaException` did.
+//! Errors from the GPU layer. Every device-runtime call is checked; a failure becomes a
+//! [`GpuError::Hip`] or [`GpuError::Cuda`] carrying the driver's own message, which is what
+//! the C++ miner's `CudaException` did.
+//!
+//! Both variants exist in every build even though only one vendor is compiled in: which one
+//! the caller sees is a build-time choice, but matching on the enum should not be.
 
 use std::fmt;
 
@@ -10,6 +13,14 @@ pub type Result<T> = std::result::Result<T, GpuError>;
 pub enum GpuError {
     /// A HIP runtime call failed. `message` is `hipGetErrorString`'s text.
     Hip {
+        call: &'static str,
+        code: i32,
+        message: String,
+    },
+    /// A CUDA driver call failed. `message` is `cuGetErrorString`'s text.
+    ///
+    /// Only produced by the `nvidia` feature, which has never run on real hardware.
+    Cuda {
         call: &'static str,
         code: i32,
         message: String,
@@ -32,6 +43,11 @@ impl fmt::Display for GpuError {
                 code,
                 message,
             } => write!(formatter, "{call} failed: {message} (hipError {code})"),
+            GpuError::Cuda {
+                call,
+                code,
+                message,
+            } => write!(formatter, "{call} failed: {message} (CUresult {code})"),
             GpuError::NoKernel => formatter.write_str(
                 "tm-gpu was built without hipcc; no Argon2 device kernel is available",
             ),

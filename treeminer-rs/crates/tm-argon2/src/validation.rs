@@ -115,6 +115,9 @@ pub fn validate_request(request: &HashRequest) -> Result<(), ValidationErrors> {
     }
 
     if request.gpu_first_blocks && request.backend != "cuda" {
+        // Wording matches the C++ miner verbatim (HashApiValidation.cpp:120) because the
+        // hash CLI's JSON is diffed against that binary. "cuda" here is the backend's wire
+        // name, not a claim about the vendor — the CLI advertises it as `gpu`.
         messages.push("gpu_first_blocks requires backend=cuda".to_string());
     }
 

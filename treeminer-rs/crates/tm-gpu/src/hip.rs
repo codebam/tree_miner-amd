@@ -25,8 +25,11 @@ pub type hipFunction_t = *mut c_void;
 
 pub const HIP_SUCCESS: hipError_t = 0;
 
-pub const HIP_MEMCPY_HOST_TO_DEVICE: c_int = 1;
-pub const HIP_MEMCPY_DEVICE_TO_HOST: c_int = 2;
+/// `hipMemcpyKind`. Named without the vendor prefix because `runner.rs` passes the same
+/// constant to whichever backend is compiled in; the CUDA layer translates it into the
+/// memory-type fields of `CUDA_MEMCPY2D`.
+pub const MEMCPY_HOST_TO_DEVICE: c_int = 1;
+pub const MEMCPY_DEVICE_TO_HOST: c_int = 2;
 
 /// The sentinels `hipModuleLaunchKernel` reads its `extra` list with. HIP defines them as
 /// literal small integers cast to pointers, not as addresses (hip_runtime_api.h).
@@ -240,7 +243,7 @@ impl DeviceBuffer {
                 self.pointer,
                 source.as_ptr().cast::<c_void>(),
                 source.len(),
-                HIP_MEMCPY_HOST_TO_DEVICE,
+                MEMCPY_HOST_TO_DEVICE,
             )
         })
     }

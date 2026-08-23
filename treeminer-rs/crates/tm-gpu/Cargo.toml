@@ -17,7 +17,17 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 
 [features]
-default = ["rust-kernel"]
+default = ["amd"]
+# AMD/ROCm. The tested vendor: gfx1100, all 44 fixture vectors byte-exact, raw-block
+# differential against the hipcc kernels green, ~1.5x the HIP kernel's hashrate.
+amd = ["rust-kernel", "hip-kernel"]
+# NVIDIA/CUDA. **Compile-verified only — never executed.** The machine this was written on
+# has no NVIDIA GPU, so not one digest has come out of this path. It builds the same Rust
+# Argon2 kernels for `nvptx64-nvidia-cuda`, emits PTX, and drives them through the CUDA
+# driver API. Mutually exclusive with `amd`, which is why it is not additive:
+# `--no-default-features --features nvidia`. Before trusting it, run
+# `tests/parity/run_parity.sh` and `cargo test -p tm-gpu` on real hardware. See PORT.md.
+nvidia = []
 # The Argon2 device kernels written in Rust (`../tm-kernel`, compiled for amdgcn and loaded
 # with hipModuleLoad). This is the shipping path: it reproduces all 44 fixture vectors byte
 # for byte, agrees with the HIP kernel on raw block output, and runs ~1.5x faster because it

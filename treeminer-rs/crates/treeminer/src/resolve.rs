@@ -49,8 +49,8 @@ pub enum ResolveError {
     ValueNotANumber { key: String, text: String },
     #[error("Invalid dashboard bind address '{0}': expected an IPv4 or IPv6 address.")]
     DashboardBind(String),
-    #[error("The argument ({0}) for CUDA streams must be 1 or 2.")]
-    CudaStreams(i32),
+    #[error("The argument ({0}) for GPU streams must be 1 or 2.")]
+    GpuStreams(i32),
     #[error("The argument ({requested}) for CPU workers must be between 0 and {ceiling}.")]
     CpuWorkers { requested: i32, ceiling: u32 },
     #[error("The argument ({0}) for the CPU difficulty ceiling must be 0-100000000.")]
@@ -118,7 +118,9 @@ pub struct ResolvedConfig {
     pub devfee_permillage: i32,
 
     pub device_list: String,
-    pub cuda_streams_per_device: usize,
+    /// Independent device work queues per device (`--gpuStreams`). Keeps the C++ field
+    /// name because the mining loop reads it under that name.
+    pub gpu_streams_per_device: usize,
     pub cpu_worker_count: usize,
     pub cpu_max_difficulty: u32,
     /// 0 = auto (use all free GPU memory).
@@ -291,13 +293,13 @@ pub fn resolve(
     }
 
     // --- device parallelism ---
-    let mut cuda_streams_per_device = 1usize;
-    if let Some(requested) = cli.cuda_streams {
+    let mut gpu_streams_per_device = 1usize;
+    if let Some(requested) = cli.gpu_streams {
         if !(1..=2).contains(&requested) {
-            return Err(ResolveError::CudaStreams(requested));
+            return Err(ResolveError::GpuStreams(requested));
         }
-        cuda_streams_per_device = requested as usize;
-        startup_messages.push(format!("CUDA streams per device: {cuda_streams_per_device}"));
+        gpu_streams_per_device = requested as usize;
+        startup_messages.push(format!("GPU streams per device: {gpu_streams_per_device}"));
     }
 
     let mut cpu_worker_count = 0usize;
@@ -414,7 +416,7 @@ pub fn resolve(
         eco_devfee_address,
         devfee_permillage,
         device_list: cli.device.clone().unwrap_or_default(),
-        cuda_streams_per_device,
+        gpu_streams_per_device,
         cpu_worker_count,
         cpu_max_difficulty,
         max_batch_size,

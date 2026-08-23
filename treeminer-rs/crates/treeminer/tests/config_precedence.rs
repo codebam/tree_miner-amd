@@ -212,28 +212,47 @@ fn identity_precedence_cli_beats_config() {
 // ---------------------------------------------------------------- bounded options
 
 #[test]
-fn cuda_streams_is_bounded_to_one_or_two() {
+fn gpu_streams_is_bounded_to_one_or_two() {
     let fixture = Fixture::new();
     assert_eq!(
-        fixture.resolve(&["--cudaStreams", "1"]).expect("resolve").cuda_streams_per_device,
+        fixture.resolve(&["--gpuStreams", "1"]).expect("resolve").gpu_streams_per_device,
         1
     );
     assert_eq!(
-        fixture.resolve(&["--cudaStreams", "2"]).expect("resolve").cuda_streams_per_device,
+        fixture.resolve(&["--gpuStreams", "2"]).expect("resolve").gpu_streams_per_device,
         2
     );
     for bad in [0, 3, -1] {
-        let error = fixture.resolve(&["--cudaStreams", &bad.to_string()]).unwrap_err();
-        assert_eq!(error, ResolveError::CudaStreams(bad));
+        let error = fixture.resolve(&["--gpuStreams", &bad.to_string()]).unwrap_err();
+        assert_eq!(error, ResolveError::GpuStreams(bad));
         assert_eq!(
             error.to_string(),
-            format!("The argument ({bad}) for CUDA streams must be 1 or 2.")
+            format!("The argument ({bad}) for GPU streams must be 1 or 2.")
         );
     }
     // Absent means the C++ default of one stream, with no banner line.
     let resolved = fixture.resolve(&[]).expect("resolve");
-    assert_eq!(resolved.cuda_streams_per_device, 1);
-    assert!(!resolved.startup_messages.iter().any(|m| m.starts_with("CUDA streams")));
+    assert_eq!(resolved.gpu_streams_per_device, 1);
+    assert!(!resolved.startup_messages.iter().any(|m| m.starts_with("GPU streams")));
+}
+
+/// The deployed spelling must resolve identically, including the banner line, so an
+/// existing unit file that passes `--cudaStreams` keeps its second queue.
+#[test]
+fn the_cuda_streams_alias_resolves_like_the_primary_spelling() {
+    let fixture = Fixture::new();
+    let aliased = fixture.resolve(&["--cudaStreams", "2"]).expect("resolve");
+    let primary = fixture.resolve(&["--gpuStreams", "2"]).expect("resolve");
+    assert_eq!(aliased.gpu_streams_per_device, 2);
+    assert_eq!(aliased.gpu_streams_per_device, primary.gpu_streams_per_device);
+    assert!(aliased
+        .startup_messages
+        .iter()
+        .any(|m| m == "GPU streams per device: 2"));
+    assert_eq!(
+        fixture.resolve(&["--cudaStreams", "0"]).unwrap_err(),
+        ResolveError::GpuStreams(0)
+    );
 }
 
 #[test]
@@ -534,4 +553,40 @@ fn a_zero_devfee_suppresses_the_ecosystem_address_in_the_banner() {
     let resolved = fixture.resolve(&["--ecoDevAddr", &eco]).expect("resolve");
     let last = resolved.startup_messages.last().expect("banner");
     assert!(last.ends_with("Devfee set at 0/1000."), "{last}");
+}
+
+// ------------------------------------------------- config-file keys are frozen vocabulary
+
+/// The CLI vocabulary moved off vendor names; the config-file keys did not, and must not.
+/// This is a `config.txt` exactly as an older build wrote it, byte for byte.
+#[test]
+fn a_config_file_from_the_old_build_still_loads() {
+    let fixture = Fixture::new();
+    let stored = address(3);
+    fs::write(
+        &fixture.config_path,
+        format!(
+            "account_address={stored}\n\
+             dashboard_bind=127.0.0.1\n\
+             dashboard_port=8080\n\
+             devfee_permillage=25\n\
+             difficulty_margin=1500\n\
+             difficulty_margin_mode=fixed\n\
+             journal_path=/var/lib/treeminer/journal.db\n",
+        ),
+    )
+    .expect("write legacy config");
+
+    let cli = Cli::try_parse_from(["treeminer"]).expect("parse");
+    let resolved = resolve(&cli, &fixture.options(), &mut NoPrompter).expect("resolve");
+    assert_eq!(resolved.miner_address, stored);
+    assert_eq!(resolved.devfee_permillage, 25);
+    assert_eq!(resolved.dashboard_bind, "127.0.0.1");
+    assert_eq!(resolved.dashboard_port, 8080);
+    assert_eq!(resolved.margin.mode, MarginMode::Fixed);
+    assert_eq!(resolved.difficulty_margin, 1500);
+    assert_eq!(
+        resolved.journal_path,
+        PathBuf::from("/var/lib/treeminer/journal.db")
+    );
 }

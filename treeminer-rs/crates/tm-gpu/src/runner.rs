@@ -4,8 +4,8 @@
 use std::ffi::c_void;
 
 use crate::error::{GpuError, Result};
-use crate::hip::{
-    self, DeviceBuffer, Event, Stream, HIP_MEMCPY_DEVICE_TO_HOST, HIP_MEMCPY_HOST_TO_DEVICE,
+use crate::driver::{
+    self as driver, DeviceBuffer, Event, Stream, MEMCPY_DEVICE_TO_HOST, MEMCPY_HOST_TO_DEVICE,
 };
 use crate::params::{Argon2Shape, ARGON2_BLOCK_SIZE, DEFAULT_HASH_LENGTH};
 
@@ -246,14 +246,14 @@ impl KernelRunner {
         // bytes fit. `blocks_in` is `batch_size * copy_size` long and is owned by `self`,
         // which cannot be mutated again before `finish` synchronises the stream.
         unsafe {
-            hip::memcpy_2d_async(
+            driver::memcpy_2d_async(
                 self.memory.as_ptr(),
                 self.job_bytes(),
                 self.blocks_in.as_ptr().cast::<c_void>(),
                 copy_size,
                 copy_size,
                 self.batch_size,
-                HIP_MEMCPY_HOST_TO_DEVICE,
+                MEMCPY_HOST_TO_DEVICE,
                 self.stream.raw(),
             )
         }
@@ -270,14 +270,14 @@ impl KernelRunner {
         // synchronised the stream.
         unsafe {
             let source = self.memory.as_ptr().cast::<u8>().add(job_bytes - copy_size);
-            hip::memcpy_2d_async(
+            driver::memcpy_2d_async(
                 self.blocks_out.as_mut_ptr().cast::<c_void>(),
                 copy_size,
                 source.cast::<c_void>(),
                 job_bytes,
                 copy_size,
                 batch_size,
-                HIP_MEMCPY_DEVICE_TO_HOST,
+                MEMCPY_DEVICE_TO_HOST,
                 stream,
             )
         }
@@ -313,7 +313,7 @@ impl KernelRunner {
         // outlives the stream (field order), and every job's first two blocks were just
         // filled by one of the two branches above.
         unsafe {
-            hip::launch_oneshot(
+            driver::launch_oneshot(
                 &self.stream,
                 self.memory.as_ptr(),
                 self.shape.segment_blocks(),
@@ -338,7 +338,7 @@ impl KernelRunner {
         // SAFETY: `keys` holds batch_size * key_length bytes and `salt` salt_length bytes,
         // both checked when they were staged; all three buffers outlive the stream.
         unsafe {
-            hip::launch_first_blocks(
+            driver::launch_first_blocks(
                 &self.stream,
                 self.memory.as_ptr(),
                 keys.as_ptr(),
@@ -387,7 +387,7 @@ impl KernelRunner {
 /// at once — the public API only exposes whichever one the feature selected. Comparing raw
 /// blocks rather than the final digest is deliberate: two compensating bugs can still agree
 /// on a digest, but they cannot agree on a kilobyte of Argon2 output.
-#[cfg(all(test, feature = "rust-kernel"))]
+#[cfg(all(test, feature = "amd", feature = "rust-kernel", feature = "hip-kernel"))]
 mod kernel_differential {
     use super::*;
     use crate::device::Device;
@@ -443,8 +443,8 @@ mod kernel_differential {
             // synchronised below before anything is read.
             unsafe {
                 let launch: Launch = match which {
-                    Which::Hip => hip::launch_first_blocks_hip,
-                    Which::Rust => hip::launch_first_blocks,
+                    Which::Hip => driver::launch_first_blocks_hip,
+                    Which::Rust => driver::launch_first_blocks,
                 };
                 launch(
                     &self.stream,
@@ -470,14 +470,14 @@ mod kernel_differential {
             // stride, so `batch_size` rows of `row` bytes at pitch `job_bytes()` are inside
             // the pool; `blocks` is exactly that size and is read only after the sync.
             unsafe {
-                hip::memcpy_2d_async(
+                driver::memcpy_2d_async(
                     blocks.as_mut_ptr().cast::<c_void>(),
                     row,
                     self.memory.as_ptr().cast_const(),
                     self.job_bytes(),
                     row,
                     self.batch_size,
-                    HIP_MEMCPY_DEVICE_TO_HOST,
+                    MEMCPY_DEVICE_TO_HOST,
                     self.stream.raw(),
                 )?;
             }
@@ -566,8 +566,8 @@ mod kernel_differential {
             // outlives the stream, and the caller staged every job's first two blocks.
             unsafe {
                 let launch: LaunchOneshot = match which {
-                    Which::Hip => hip::launch_oneshot_hip,
-                    Which::Rust => hip::launch_oneshot,
+                    Which::Hip => driver::launch_oneshot_hip,
+                    Which::Rust => driver::launch_oneshot,
                 };
                 launch(
                     &self.stream,

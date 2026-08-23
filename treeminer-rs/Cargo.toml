@@ -20,7 +20,10 @@ license = "MIT"
 [workspace.dependencies]
 tm-core = { path = "crates/tm-core" }
 tm-argon2 = { path = "crates/tm-argon2" }
-tm-gpu = { path = "crates/tm-gpu" }
+# `default-features = false` here so that a member may switch vendor: treeminer forwards its
+# own `amd` / `nvidia` features to tm-gpu, and cargo ignores a member's `default-features`
+# unless the workspace entry states one.
+tm-gpu = { path = "crates/tm-gpu", default-features = false }
 tm-journal = { path = "crates/tm-journal" }
 tm-submit = { path = "crates/tm-submit" }
 tm-dashboard = { path = "crates/tm-dashboard" }

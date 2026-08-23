@@ -5,12 +5,17 @@ edition = "2021"
 license = "MIT"
 publish = false
 
-# Not a workspace member: this crate is only ever compiled for `amdgcn-amd-amdhsa` by
-# tm-gpu's build.rs (see PORT.md, "Rust GPU kernels"). Building it for the host would fail —
-# it is `#![no_std]` with a GPU-only ABI — so the workspace root excludes it.
+# Not a workspace member: this crate is only ever compiled for a GPU target by tm-gpu's
+# build.rs — `amdgcn-amd-amdhsa` (tested) or `nvptx64-nvidia-cuda` (compile-verified only),
+# see PORT.md, "Rust GPU kernels". Building it for the host would fail — it is `#![no_std]`
+# with a GPU-only ABI — so the workspace root excludes it.
 [workspace]
 
 [lib]
+# The amdgcn build links a code object, so `cdylib`. The nvptx build overrides this with
+# `cargo rustc --crate-type=rlib` and `--emit=asm`, because rustc links nvptx64 with
+# `llvm-bitcode-linker`, which the nix rustc does not ship; see build_nvptx in
+# ../tm-gpu/build.rs.
 crate-type = ["cdylib"]
 
 [profile.release]

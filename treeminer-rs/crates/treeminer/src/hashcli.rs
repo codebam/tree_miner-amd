@@ -7,6 +7,7 @@
 //! through the C++ one and compares the digests, so the flags and the `--json` field names
 //! have to match the C++ exactly rather than being modernised.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
 use std::process::ExitCode;
@@ -22,11 +23,18 @@ use tm_core::batch::{
     DEFAULT_MEMORY_RESERVE_BYTES,
 };
 
+/// Which runtime `tm_core` should size batches for; follows the vendor `tm-gpu` was built
+/// with. ROCm needs a much larger VRAM cushion than CUDA — see `tm_core::batch`.
+#[cfg(feature = "amd")]
+const RUNTIME: GpuRuntimeKind = GpuRuntimeKind::Hip;
+#[cfg(feature = "nvidia")]
+const RUNTIME: GpuRuntimeKind = GpuRuntimeKind::Cuda;
+
 const USAGE: &str = concat!(
     "Hash API commands:\n",
-    "  xenblocksMiner hash-one --salt <hex> --key <64-hex> [--backend cpu|cuda] [--difficulty <n>] [--no-xuni] [--detailed-timings] [--first-block-workers <n>] [--first-block-dynamic-chunk-size <n>] [--first-block-dynamic-chunk-auto] [--gpu-first-blocks] [--json]\n",
-    "  xenblocksMiner hash-batch --salt <hex> [--backend cpu|cuda] [--prefix <hex>] [--pattern XEN11] [--batch-size <n>] [--auto-batch-size] [--difficulty <n>] [--no-xuni] [--detailed-timings] [--first-block-workers <n>] [--first-block-dynamic-chunk-size <n>] [--first-block-dynamic-chunk-auto] [--gpu-first-blocks] [--json]\n",
-    "  xenblocksMiner hash-benchmark --salt <hex> [--backend cpu|cuda] [--key <64-hex>] [--prefix <hex>] [--seconds <n>] [--batch-size <n>] [--auto-batch-size] [--batch-size-sequence <n,n,...>] [--difficulty <n>] [--difficulty-sequence <n,n,...>] [--no-xuni] [--detailed-timings] [--first-block-workers <n>] [--first-block-dynamic-chunk-size <n>] [--first-block-dynamic-chunk-auto] [--gpu-first-blocks] [--json]\n",
+    "  xenblocksMiner hash-one --salt <hex> --key <64-hex> [--backend cpu|gpu] [--difficulty <n>] [--no-xuni] [--detailed-timings] [--first-block-workers <n>] [--first-block-dynamic-chunk-size <n>] [--first-block-dynamic-chunk-auto] [--gpu-first-blocks] [--json]\n",
+    "  xenblocksMiner hash-batch --salt <hex> [--backend cpu|gpu] [--prefix <hex>] [--pattern XEN11] [--batch-size <n>] [--auto-batch-size] [--difficulty <n>] [--no-xuni] [--detailed-timings] [--first-block-workers <n>] [--first-block-dynamic-chunk-size <n>] [--first-block-dynamic-chunk-auto] [--gpu-first-blocks] [--json]\n",
+    "  xenblocksMiner hash-benchmark --salt <hex> [--backend cpu|gpu] [--key <64-hex>] [--prefix <hex>] [--seconds <n>] [--batch-size <n>] [--auto-batch-size] [--batch-size-sequence <n,n,...>] [--difficulty <n>] [--difficulty-sequence <n,n,...>] [--no-xuni] [--detailed-timings] [--first-block-workers <n>] [--first-block-dynamic-chunk-size <n>] [--first-block-dynamic-chunk-auto] [--gpu-first-blocks] [--json]\n",
 );
 
 /// Flags that take no value; everything else consumes the next argument.
@@ -38,6 +46,41 @@ const BOOL_FLAGS: &[&str] = &[
     "--first-block-dynamic-chunk-auto",
     "--gpu-first-blocks",
 ];
+
+/// The backend names the CLI accepts, folded onto the names `tm-argon2` validates.
+///
+/// `gpu` is the honest spelling for the device backend on this miner: the kernels are HIP,
+/// not CUDA. `cuda` is what the C++ miner calls the same backend, so it stays accepted --
+/// `tests/parity/run_parity.sh` drives both binaries with one command line -- but it is not
+/// advertised. `reference` is the portable CPU implementation the fixture tests compare
+/// against.
+fn canonical_backend(requested: &str) -> Option<&'static str> {
+    match requested {
+        "cpu" => Some("cpu"),
+        "reference" => Some("reference"),
+        "gpu" | "cuda" => Some("cuda"),
+        _ => None,
+    }
+}
+
+/// True for either spelling of the device backend.
+fn is_gpu_backend(backend: &str) -> bool {
+    matches!(backend, "gpu" | "cuda")
+}
+
+/// `request.backend` carries the spelling the operator typed, because the JSON echoes it
+/// back and the parity harness diffs that field. `tm-argon2` only knows the C++ names, so
+/// the request is folded onto those before it is validated.
+fn with_canonical_backend(request: &HashRequest) -> Cow<'_, HashRequest> {
+    match canonical_backend(&request.backend) {
+        Some(canonical) if canonical != request.backend => {
+            let mut folded = request.clone();
+            canonical.clone_into(&mut folded.backend);
+            Cow::Owned(folded)
+        }
+        _ => Cow::Borrowed(request),
+    }
+}
 
 /// True when `args` (the whole argv) names a hash-API subcommand.
 pub fn is_hash_api_command(args: &[String]) -> bool {
@@ -116,7 +159,7 @@ fn dispatch(
         "hash-batch" => {
             request.batch_size = args.size("--batch-size", 1)?;
             if args.flag("--auto-batch-size") {
-                request.batch_size = automatic_cuda_batch_size(
+                request.batch_size = automatic_gpu_batch_size(
                     &request,
                     &[],
                     if args.has("--batch-size") {
@@ -134,7 +177,7 @@ fn dispatch(
             let difficulty_sequence = parse_difficulty_sequence(&args.get("--difficulty-sequence", ""))?;
             let batch_size_sequence = parse_batch_size_sequence(&args.get("--batch-size-sequence", ""))?;
             if args.flag("--auto-batch-size") && batch_size_sequence.is_empty() {
-                request.batch_size = automatic_cuda_batch_size(
+                request.batch_size = automatic_gpu_batch_size(
                     &request,
                     &difficulty_sequence,
                     if args.has("--batch-size") {
@@ -231,9 +274,15 @@ pub fn parse_args(argv: &[String]) -> Args {
 /// Port of `baseRequest`.
 pub fn base_request(args: &Args) -> Result<HashRequest, String> {
     let defaults = HashRequest::default();
+    let backend = args.get("--backend", "cpu");
+    if canonical_backend(&backend).is_none() {
+        return Err(format!(
+            "unsupported backend: {backend} (valid backends: cpu, gpu)"
+        ));
+    }
     Ok(HashRequest {
         request_id: args.get("--request-id", ""),
-        backend: args.get("--backend", "cpu"),
+        backend,
         salt_hex: args.get("--salt", ""),
         key: args.get("--key", ""),
         key_prefix: args.get("--prefix", ""),
@@ -318,13 +367,13 @@ fn error_result(request: &HashRequest, backend: &str, message: String) -> HashRe
 
 /// Port of `runBackend`: one request, one fresh backend.
 pub fn run_backend(request: &HashRequest) -> HashResult {
-    if request.backend == "cuda" {
-        if let Err(errors) = tm_argon2::validate_request(request) {
+    if is_gpu_backend(&request.backend) {
+        if let Err(errors) = tm_argon2::validate_request(&with_canonical_backend(request)) {
             return error_result(request, &request.backend, errors.to_string());
         }
-        return match CudaHashBackend::open(request.device_id) {
+        return match GpuHashBackend::open(request.device_id) {
             Ok(mut backend) => backend.run_batch(request),
-            Err(message) => error_result(request, "cuda", message),
+            Err(message) => error_result(request, &request.backend, message),
         };
     }
     tm_argon2::CpuHashBackend.run_batch(request)
@@ -333,22 +382,23 @@ pub fn run_backend(request: &HashRequest) -> HashResult {
 /// Port of `makeReusableBackend`: the benchmark keeps one backend across iterations so the
 /// device pool is allocated once.
 fn make_reusable_backend(request: &HashRequest) -> Result<Box<dyn HashBackend>, String> {
-    if request.backend == "cuda" {
-        return Ok(Box::new(CudaHashBackend::open(request.device_id)?));
+    if is_gpu_backend(&request.backend) {
+        return Ok(Box::new(GpuHashBackend::open(request.device_id)?));
     }
     Ok(Box::new(tm_argon2::CpuHashBackend))
 }
 
-/// The `IHashBackend` implementation over `tm-gpu`. Port of `CudaHashBackend`.
+/// The `IHashBackend` implementation over `tm-gpu`. Port of `CudaHashBackend.cpp`, which
+/// is CUDA in name only here -- the kernels it reaches are HIP.
 ///
 /// The first blocks are filled by `tm_argon2::CpuArgon2Host` unless `--gpu-first-blocks`
 /// is set, which is why the CLI is the natural place to check the two against each other.
-pub struct CudaHashBackend {
+pub struct GpuHashBackend {
     backend: tm_gpu::GpuHashBackend,
     device_id: i32,
 }
 
-impl CudaHashBackend {
+impl GpuHashBackend {
     pub fn open(device_id: i32) -> Result<Self, String> {
         let device = tm_gpu::Device::open(device_id).map_err(|error| error.to_string())?;
         Ok(Self {
@@ -358,13 +408,15 @@ impl CudaHashBackend {
     }
 }
 
-impl HashBackend for CudaHashBackend {
+impl HashBackend for GpuHashBackend {
     fn run_batch(&mut self, request: &HashRequest) -> HashResult {
         let total_start = Instant::now();
         let mut result = HashResult {
             request_id: request.request_id.clone(),
             algorithm: request.algorithm.clone(),
-            backend: "cuda".to_owned(),
+            // The requested spelling, echoed back: the parity harness diffs this field
+            // against the C++ miner, which only ever sees `cuda`.
+            backend: request.backend.clone(),
             device_id: self.device_id,
             batch_size: request.batch_size,
             gpu_first_blocks: request.gpu_first_blocks,
@@ -372,15 +424,15 @@ impl HashBackend for CudaHashBackend {
         };
 
         let validation_start = Instant::now();
-        let validation = tm_argon2::validate_request(request);
+        let validation = tm_argon2::validate_request(&with_canonical_backend(request));
         result.timings.validation_ms = millis_since(validation_start);
         if let Err(errors) = validation {
             result.error = errors.to_string();
             result.timings.total_ms = millis_since(total_start);
             return result;
         }
-        if request.backend != "cuda" {
-            result.error = "CudaHashBackend requires backend=cuda".to_owned();
+        if !is_gpu_backend(&request.backend) {
+            result.error = "GpuHashBackend requires --backend gpu".to_owned();
             result.timings.total_ms = millis_since(total_start);
             return result;
         }
@@ -499,13 +551,13 @@ impl HashBackend for CudaHashBackend {
 /// Port of `selectAutomaticCudaBatchSize`, including the difficulty-sequence variant of
 /// `HashApiTuning.cpp`: the sequence is sized for its *largest* difficulty, so one pool
 /// serves every shape the benchmark cycles through.
-fn automatic_cuda_batch_size(
+fn automatic_gpu_batch_size(
     request: &HashRequest,
     difficulty_sequence: &[u32],
     explicit_max_batch_size: usize,
 ) -> Result<usize, String> {
-    if request.backend != "cuda" {
-        return Err("--auto-batch-size is only supported with --backend cuda".to_owned());
+    if !is_gpu_backend(&request.backend) {
+        return Err("--auto-batch-size is only supported with --backend gpu".to_owned());
     }
     let device = tm_gpu::Device::open(request.device_id).map_err(|error| error.to_string())?;
     let free_memory = device
@@ -514,7 +566,7 @@ fn automatic_cuda_batch_size(
 
     let selected = if difficulty_sequence.is_empty() {
         tm_core::select_batch_size(
-            GpuRuntimeKind::Hip,
+            RUNTIME,
             free_memory,
             request.difficulty,
             explicit_max_batch_size,
@@ -524,7 +576,7 @@ fn automatic_cuda_batch_size(
         select_batch_size_for_sequence(free_memory, difficulty_sequence, explicit_max_batch_size)
     };
     if selected == 0 {
-        return Err("automatic CUDA batch-size selection found no safe batch size".to_owned());
+        return Err("automatic GPU batch-size selection found no safe batch size".to_owned());
     }
     Ok(selected)
 }
@@ -538,7 +590,7 @@ fn select_batch_size_for_sequence(
         return 0;
     };
     let memory_limited = estimate_memory_batch_limit(
-        GpuRuntimeKind::Hip,
+        RUNTIME,
         free_memory_bytes,
         max_difficulty,
         DEFAULT_MEMORY_RESERVE_BYTES,

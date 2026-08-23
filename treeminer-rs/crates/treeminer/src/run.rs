@@ -201,7 +201,7 @@ pub fn run(config: &ResolvedConfig) -> u8 {
         sink: Arc::clone(&sink),
         identity,
         max_batch_size: config.max_batch_size,
-        streams_per_device: config.cuda_streams_per_device,
+        streams_per_device: config.gpu_streams_per_device,
         xuni_window_open: Arc::new(crate::mineunit::xuni_window_open_now),
     });
     let mining_threads = spawn_mining_threads(&mining_devices, config, &deps, &host);
@@ -698,7 +698,7 @@ fn spawn_mining_threads(
 ) -> Vec<std::thread::JoinHandle<()>> {
     let mut threads = Vec::new();
     for &index in devices {
-        for stream in 0..config.cuda_streams_per_device {
+        for stream in 0..config.gpu_streams_per_device {
             let backend = match GpuMiningBackend::open(index, host.clone()) {
                 Ok(backend) => backend,
                 Err(error) => {

@@ -2,7 +2,7 @@
 //! `src/CudaBackend.cpp`.
 
 use crate::error::{GpuError, Result};
-use crate::hip;
+use crate::driver;
 
 /// One GPU, identified the way the dashboard and the telemetry session need it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,26 +15,26 @@ pub struct Device {
 }
 
 impl Device {
-    /// Opens one device by its HIP index.
+    /// Opens one device by its runtime index.
     pub fn open(index: i32) -> Result<Self> {
-        let count = hip::device_count()?;
+        let count = driver::device_count()?;
         if index < 0 || index >= count {
             return Err(GpuError::NoSuchDevice(index));
         }
-        let pci_bus_id = hip::device_pci_bus_id(index)?;
+        let pci_bus_id = driver::device_pci_bus_id(index)?;
         Ok(Self {
             index,
-            name: hip::device_name(index)?,
+            name: driver::device_name(index)?,
             bus_id: parse_bus_id(&pci_bus_id).unwrap_or(-1),
             pci_bus_id,
-            total_memory_bytes: hip::device_total_memory(index)?,
+            total_memory_bytes: driver::device_total_memory(index)?,
         })
     }
 
     /// Every device the runtime reports. An absent or broken driver yields an error, not a
     /// panic, so the caller can fall back to CPU mining.
     pub fn enumerate() -> Result<Vec<Self>> {
-        let count = hip::device_count()?;
+        let count = driver::device_count()?;
         (0..count).map(Self::open).collect()
     }
 
@@ -69,14 +69,14 @@ impl Device {
 
     /// Binds this device to the calling thread. Must be called before any allocation on it.
     pub fn activate(&self) -> Result<()> {
-        hip::set_device(self.index)
+        driver::set_device(self.index)
     }
 
     /// Free VRAM on this device. Requires the device to be active on this thread, so it is
-    /// activated first — `hipMemGetInfo` always reports the current device.
+    /// activated first — the free-memory query always reports the current device.
     pub fn free_memory_bytes(&self) -> Result<usize> {
         self.activate()?;
-        let (free, _total) = hip::mem_get_info()?;
+        let (free, _total) = driver::mem_get_info()?;
         Ok(free)
     }
 }
