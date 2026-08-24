@@ -21,15 +21,16 @@ pub mod transport;
 
 pub use breaker::{BreakerConfig, BreakerState, CircuitBreaker};
 pub use classifier::{
-    classify, extract_json_field, extract_json_message, parse_difficulty_hint,
-    parse_retry_after_seconds, TRANSPORT_ERROR,
+    classify, extract_json_field, extract_json_message, is_difficulty_mismatch,
+    is_xuni_window_rejection, parse_difficulty_hint, parse_retry_after_seconds,
+    terminal_marker, TERMINAL_MARKERS, TRANSPORT_ERROR,
 };
 pub use clocktime::{iso_utc, parse_http_date_ms, xuni_window_at};
 pub use drain::{DifficultyTrend, DrainConfig, DrainScheduler, XuniWindowState};
-pub use http::HttpTransport;
+pub use http::{derive_health_probe_url, HttpTransport, HEALTH_PROBE_PATH, HEALTH_PROBE_PORT};
 pub use journal::{JournalAccess, JournalCounts, JournalError, JournalResult};
 pub use manager::{
-    Config, ConfirmBodyCheck, Metrics, StepResult, SubmissionManager,
+    Config, ConfirmBodyCheck, Metrics, StepResult, SubmissionManager, QUIESCE_MAX_MS,
 };
 pub use margin::{compute_margin, MarginConfig, MarginInputs, MarginMode};
 pub use transport::{Transport, TransportResult};

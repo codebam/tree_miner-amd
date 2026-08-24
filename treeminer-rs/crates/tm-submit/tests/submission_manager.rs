@@ -765,3 +765,214 @@ fn thread_loop_survives_a_journal_failure_and_stop_joins_cleanly() {
     assert_eq!(m.metrics().thread_loop_exceptions, 1);
     assert_eq!(journal.throw_count(), 1);
 }
+
+// --- breaker health probe: off the flaky port-80 /difficulty route ---
+//
+// Measured on the live network, `GET http://xenblocks.io/difficulty` timed out on 6 of 14
+// requests while ports 4445/4447 answered every one. Probing only that route made the
+// breaker open on ordinary flakiness of the least reliable endpoint the miner touches.
+
+/// Drive the manager to Open with three transport failures. Returns the record id.
+fn force_outage(f: &Fixture, m: &Manager) -> i64 {
+    let id = f.journal.append(payload("hp11", FindKind::Xen11, 100_000));
+    for i in 0..3 {
+        if i > 0 {
+            f.clocks.advance(60_000);
+        }
+        f.transport.push_submit(down());
+        assert_eq!(m.run_once(), StepResult::Submitted);
+    }
+    assert_eq!(m.breaker_state(), BreakerState::Open);
+    f.clocks.advance(6000); // probe due
+    id
+}
+
+#[test]
+fn a_healthy_probe_route_recovers_the_breaker_even_while_difficulty_is_down() {
+    let f = Fixture::with_wall(WALL_CLOSED_WINDOW);
+    let m = f.manager();
+    force_outage(&f, &m);
+
+    // Port 4447 answers, port 80 /difficulty does not. That is the real-world split, and it
+    // must count as "the server is up".
+    f.transport.push_health(ok(200, r#"{"total_blocks":219911124}"#));
+    f.transport.push_difficulty(down()); // the opportunistic difficulty harvest fails
+    assert_eq!(m.run_once(), StepResult::Probed);
+    assert_eq!(m.breaker_state(), BreakerState::HalfOpen);
+    assert_eq!(f.transport.health_calls(), 1);
+    // No difficulty in the health body and none harvested: the probe still succeeded.
+    assert_eq!(m.last_observed_difficulty(), None);
+}
+
+#[test]
+fn a_health_body_carrying_difficulty_skips_the_extra_difficulty_call() {
+    let f = Fixture::with_wall(WALL_CLOSED_WINDOW);
+    let m = f.manager();
+    force_outage(&f, &m);
+
+    // The leaderboard route embeds `difficulty` in a much larger object; one round-trip is
+    // then enough and no follow-up /difficulty is issued.
+    f.transport
+        .push_health(ok(200, r#"{"difficulty":"5100","miners":[]}"#));
+    assert_eq!(m.run_once(), StepResult::Probed);
+    assert_eq!(m.breaker_state(), BreakerState::HalfOpen);
+    assert_eq!(f.transport.difficulty_calls(), 0);
+    assert_eq!(m.last_observed_difficulty(), Some(5100));
+}
+
+#[test]
+fn difficulty_is_the_fallback_when_the_health_route_is_down() {
+    let f = Fixture::with_wall(WALL_CLOSED_WINDOW);
+    let m = f.manager();
+    force_outage(&f, &m);
+
+    // The health route fails but /difficulty answers: still not an outage.
+    f.transport.push_health(down());
+    f.transport
+        .push_difficulty(ok(200, r#"{"difficulty": "100000"}"#));
+    assert_eq!(m.run_once(), StepResult::Probed);
+    assert_eq!(m.breaker_state(), BreakerState::HalfOpen);
+    assert_eq!(m.last_observed_difficulty(), Some(100_000));
+}
+
+#[test]
+fn the_breaker_stays_open_only_when_both_routes_are_down() {
+    let f = Fixture::with_wall(WALL_CLOSED_WINDOW);
+    let m = f.manager();
+    force_outage(&f, &m);
+
+    f.transport.push_health(down());
+    f.transport.push_difficulty(down());
+    assert_eq!(m.run_once(), StepResult::Probed);
+    assert_eq!(m.breaker_state(), BreakerState::Open);
+    assert_eq!(f.transport.health_calls(), 1);
+    assert_eq!(f.transport.difficulty_calls(), 1);
+    assert_eq!(m.metrics().probes, 1); // one probe CYCLE, however many routes it tried
+
+    // An empty 200 from either route is not proof of life (a proxy answers those).
+    f.clocks.advance(60_000);
+    f.transport.push_health(ok(200, "   "));
+    f.transport.push_difficulty(ok(200, ""));
+    assert_eq!(m.run_once(), StepResult::Probed);
+    assert_eq!(m.breaker_state(), BreakerState::Open);
+}
+
+// --- difficulty-transition quiesce ---
+
+#[test]
+fn a_difficulty_change_briefly_holds_submissions_then_resumes() {
+    let f = Fixture::with_wall(WALL_CLOSED_WINDOW);
+    let m = f.manager_with(Config {
+        difficulty_quiesce_ms: 5000,
+        ..Config::default()
+    });
+    let p = payload("qq11", FindKind::Xen11, 100_000);
+    let id = f.journal.append(p.clone());
+
+    // The first observation carries no information about a transition: no hold.
+    m.observe_difficulty(100_000).expect("journal ok");
+    assert_eq!(m.quiesce_remaining_ms(), 0);
+    assert_eq!(m.metrics().difficulty_quiesces, 0);
+
+    // A step: difficulty moved, so /verify pauses. The find is NOT touched — it is still
+    // Pending in the journal and no transport call was made.
+    m.observe_difficulty(101_000).expect("journal ok");
+    assert_eq!(m.quiesce_remaining_ms(), 5000);
+    assert_eq!(m.metrics().difficulty_quiesces, 1);
+    assert_eq!(m.run_once(), StepResult::Quiescing);
+    assert!(f.transport.submitted_keys().is_empty());
+    assert_eq!(f.journal.record(id).status, FindStatus::Pending);
+
+    // Still holding just before the deadline...
+    f.clocks.advance(4999);
+    assert_eq!(m.run_once(), StepResult::Quiescing);
+    assert_eq!(m.quiesce_remaining_ms(), 1);
+
+    // ...and submitting again the moment it passes. Nothing was dropped.
+    f.clocks.advance(1);
+    assert_eq!(m.quiesce_remaining_ms(), 0);
+    f.transport.push_submit(ok(200, OK_200));
+    f.transport.push_confirm(ok(200, &block_row(&p)));
+    assert_eq!(m.run_once(), StepResult::Submitted);
+    assert_eq!(f.journal.record(id).status, FindStatus::Acked);
+}
+
+#[test]
+fn quiesce_is_bounded_and_cannot_wedge_submissions() {
+    let f = Fixture::with_wall(WALL_CLOSED_WINDOW);
+    // An absurd configured hold is clamped to QUIESCE_MAX_MS, so no config value can stall
+    // the one path that gets finds paid for beyond a minute.
+    let m = f.manager_with(Config {
+        difficulty_quiesce_ms: i64::MAX,
+        ..Config::default()
+    });
+    let p = payload("qq22", FindKind::Xen11, 100_000);
+    f.journal.append(p.clone());
+
+    m.observe_difficulty(100_000).expect("journal ok");
+    // Re-arming repeatedly cannot push the deadline past one clamped hold from the last
+    // transition, and the deadline is absolute rather than a countdown that time refills.
+    for d in [101_000, 102_000, 103_000] {
+        m.observe_difficulty(d).expect("journal ok");
+        assert_eq!(m.quiesce_remaining_ms(), tm_submit::QUIESCE_MAX_MS);
+    }
+    assert_eq!(m.run_once(), StepResult::Quiescing);
+
+    f.clocks.advance(tm_submit::QUIESCE_MAX_MS);
+    assert_eq!(m.quiesce_remaining_ms(), 0);
+    f.transport.push_submit(ok(200, OK_200));
+    f.transport.push_confirm(ok(200, &block_row(&p)));
+    assert_eq!(m.run_once(), StepResult::Submitted);
+}
+
+#[test]
+fn quiesce_of_zero_disables_the_hold_entirely() {
+    let f = Fixture::with_wall(WALL_CLOSED_WINDOW);
+    let m = f.manager_with(Config {
+        difficulty_quiesce_ms: 0,
+        ..Config::default()
+    });
+    let p = payload("qq33", FindKind::Xen11, 100_000);
+    f.journal.append(p.clone());
+    m.observe_difficulty(100_000).expect("journal ok");
+    m.observe_difficulty(104_000).expect("journal ok");
+    assert_eq!(m.quiesce_remaining_ms(), 0);
+    assert_eq!(m.metrics().difficulty_quiesces, 0);
+
+    f.transport.push_submit(ok(200, OK_200));
+    f.transport.push_confirm(ok(200, &block_row(&p)));
+    assert_eq!(m.run_once(), StepResult::Submitted);
+}
+
+#[test]
+fn quiesce_holds_verify_but_not_the_breaker_probe_or_confirmations() {
+    let f = Fixture::with_wall(WALL_CLOSED_WINDOW);
+    let m = f.manager_with(Config {
+        difficulty_quiesce_ms: 5000,
+        ..Config::default()
+    });
+
+    // A 401 hint arriving mid-drain arms the quiesce from inside the submit path itself.
+    let p = payload("qq44", FindKind::Xen11, 100_000);
+    let id = f.journal.append(p.clone());
+    m.observe_difficulty(100_000).expect("journal ok");
+    f.transport.push_submit(ok(
+        401,
+        r#"{"message": "Hash does not contain 'm=104000'. Your memory_cost setting in your miner will be autoadjusted."}"#,
+    ));
+    assert_eq!(m.run_once(), StepResult::Submitted);
+    assert_eq!(f.journal.record(id).status, FindStatus::ParkedDifficulty);
+    assert_eq!(m.metrics().difficulty_quiesces, 1);
+
+    // Confirmation retries are NOT held: they are about rows the server may already hold,
+    // and they cost nothing at a difficulty boundary.
+    let unconfirmed = payload("qq55", FindKind::Xen11, 100_000);
+    let cid = f.journal.append(unconfirmed.clone());
+    f.journal.set_status(cid, FindStatus::AcceptedUnconfirmed);
+    f.transport.push_confirm(ok(200, &block_row(&unconfirmed)));
+    assert_eq!(m.run_once(), StepResult::ConfirmRetried);
+    assert_eq!(f.journal.record(cid).status, FindStatus::Acked);
+
+    // And a quiesce is not a failure: it never trips the breaker, which is still Closed.
+    assert_eq!(m.breaker_state(), BreakerState::Closed);
+}

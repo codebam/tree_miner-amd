@@ -243,6 +243,17 @@ fn append_matches(
             hash: hash.to_owned(),
             matched_pattern: "XUNI".to_owned(),
             attempt_index,
+            // NOT an oversight, and not symmetric with the arm above: the server never
+            // credits a superblock on the XUNI path, however many capitals the digest has.
+            //   * `/verify` routes a XUNI[0-9] hash into the `xuni` table and a XEN11 hash
+            //     into `blocks` (`gpage.py:468-490`). `make_superblocks.py:33-47` counts
+            //     capitals over `blocks` ONLY, so a XUNI row is never seen by it.
+            //   * The X.BLK balance credit is `check_and_credit_for_capital_count`, and it
+            //     is called from inside the `elif 'XEN' in hash_to_verify` branch of
+            //     `utils/gen_balances.py:119-124` — the XUNI branch above it credits
+            //     currency 2 (XUNI) and returns without ever reaching the capital count.
+            // Flagging it true here would only make the miner claim a reward the network
+            // does not pay.
             is_superblock: false,
         });
     }

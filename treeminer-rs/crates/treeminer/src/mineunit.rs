@@ -107,9 +107,26 @@ pub fn select_work(identity: &MiningIdentity, batch_index: i32) -> Work {
     }
 }
 
-/// True when the local clock is inside the XUNI window (`:55`–`:05`).
+/// True when the XUNI window is open **on the server's clock** (`:55`-`:05`).
+///
+/// This must be the same predicate the submitter uses, evaluated on the same instant, or
+/// the binary contradicts itself: the loop would mine XUNI the submitter refuses to send,
+/// or skip the window the submitter is draining into. It therefore calls the submitter's
+/// own `tm_submit::xuni_window_at` on the server-corrected clock from [`crate::clock`],
+/// rather than re-deriving a window from the operator's local zone. Local time was the old
+/// behaviour and it was wrong wherever the zone is not a whole hour from UTC (IST, NPT,
+/// ACST), which shifted the window by 30 or 45 minutes against the server's.
+///
+/// The window is inclusive of minute :55 and exclusive of :05, matching
+/// `is_within_five_minutes_of_hour` in `gpage.py:36-40` (`m < 5 or m >= 55`).
 pub fn xuni_window_open_now() -> bool {
-    tm_core::is_within_xuni_window_at(u32::from(crate::clock::now_local().minute()))
+    xuni_window_open_at(crate::clock::now_server_ms())
+}
+
+/// [`xuni_window_open_now`] at an explicit instant on the server's clock, in epoch
+/// milliseconds. Split out so the boundaries are testable without touching a global.
+pub fn xuni_window_open_at(server_epoch_ms: i64) -> bool {
+    tm_submit::xuni_window_at(server_epoch_ms).open
 }
 
 /// A live replacement for [`MineDeps::identity`], consulted at every batch boundary.
@@ -485,6 +502,41 @@ mod tests {
         assert_eq!(appended.len(), 1);
         assert_eq!(appended[0].memory_cost, 1000);
         assert!(appended[0].hash_to_verify.contains("m=1000,"));
+    }
+
+    /// The window the loop gates on is the submitter's, and its boundaries are the
+    /// server's: minute 55 is INSIDE (`gpage.py:36-40` allows `m >= 55`, not `m > 55`) and
+    /// minute 5 is outside. A client that starts at :56 forfeits a tenth of the window.
+    #[test]
+    fn the_window_boundaries_are_55_inclusive_and_5_exclusive() {
+        const MIN_MS: i64 = 60_000;
+        // An arbitrary exact hour boundary in UTC; only the minute offset matters.
+        let top_of_hour = 1_767_225_600_000_i64;
+        let open_at = |minute: i64| xuni_window_open_at(top_of_hour + minute * MIN_MS);
+
+        assert!(!open_at(54), "minute 54 is outside the window");
+        assert!(open_at(55), "minute 55 is INSIDE: the server tests m >= 55");
+        assert!(open_at(59));
+        assert!(open_at(60), "the top of the next hour");
+        assert!(open_at(64), "minute 4 past is inside");
+        assert!(!open_at(65), "minute 5 past closes it");
+
+        let open_minutes = (0..60).filter(|m| open_at(i64::from(*m))).count();
+        assert_eq!(open_minutes, 10, "ten minutes per hour, not nine");
+    }
+
+    /// The loop's predicate and the submitter's gate must be the same function of the same
+    /// instant — that identity is the whole of DEFECT 1.
+    #[test]
+    fn the_loop_predicate_is_the_submitter_s_own_window_function() {
+        for minute in 0..60_i64 {
+            let at = 1_767_225_600_000_i64 + minute * 60_000;
+            assert_eq!(
+                xuni_window_open_at(at),
+                tm_submit::xuni_window_at(at).open,
+                "the mining loop and the submitter must never disagree about the window"
+            );
+        }
     }
 
     #[test]

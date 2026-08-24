@@ -142,10 +142,26 @@ impl FindSink {
             key: find.key.clone(),
             hash_to_verify,
             account: format!("0x{}", find.hexsalt),
-            kind: if find.digest.contains("XEN11") {
-                FindKind::Xen11
-            } else {
+            // THE SERVER'S OWN CLASSIFICATION, NOT OURS.
+            //
+            // `FindKind` decides whether a find gets XUNI window/park semantics, so it has
+            // to agree with what `/verify` will do with the same hash. `gpage.py:429-437`
+            // tests `XUNI[0-9]` and, when it hits, applies the window gate *whatever else*
+            // the digest contains; `XEN11` is the untimed fallback (`gpage.py:421-427,
+            // 468-484`). So the rule is "XUNI[0-9] present" first, XEN11 otherwise.
+            //
+            // This used to read `digest.contains("XEN11")`, which broke on two inputs:
+            //   * a `--testBlockPattern` find whose digest carries neither token was
+            //     labelled Xuni, given a XUNI window it can never satisfy, and parked until
+            //     it expired;
+            //   * a digest carrying BOTH XEN11 and XUNI[0-9] was labelled Xen11 and
+            //     submitted outside the window, where the server 401s it.
+            // The default XEN11 path — the only one that matters in production — is
+            // unchanged: a plain XEN11 digest still classifies as Xen11.
+            kind: if tm_core::has_xuni_match(&find.digest) {
                 FindKind::Xuni
+            } else {
+                FindKind::Xen11
             },
             memory_cost: find.memory_cost,
             worker: self.machine_id.clone(),
@@ -406,10 +422,60 @@ mod tests {
         let state = Arc::new(MiningState::for_test(1000));
         let sink = sink_with(journal.clone(), Arc::clone(&state), dir.path());
 
-        sink.record(&find(1000, "abcXUNIdef"));
+        // `XUNI` must be followed by a digit to be a XUNI find (`gpage.py:430`).
+        sink.record(&find(1000, "abcXUNI7def"));
 
         assert_eq!(journal.appended()[0].kind, FindKind::Xuni);
         assert_eq!(state.xuni_blocks(), 1);
+    }
+
+    #[test]
+    fn a_bare_xuni_token_without_a_digit_is_not_a_xuni_find() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Arc::new(RecordingJournal::default());
+        let state = Arc::new(MiningState::for_test(1000));
+        let sink = sink_with(journal.clone(), Arc::clone(&state), dir.path());
+
+        sink.record(&find(1000, "abcXUNIdef"));
+
+        assert_eq!(
+            journal.appended()[0].kind,
+            FindKind::Xen11,
+            "the server's XUNI test is the regex XUNI[0-9]; a digitless XUNI is not one"
+        );
+    }
+
+    #[test]
+    fn a_custom_pattern_find_is_not_labelled_xuni() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Arc::new(RecordingJournal::default());
+        let state = Arc::new(MiningState::for_test(1000));
+        let sink = sink_with(journal.clone(), Arc::clone(&state), dir.path());
+
+        // `--testBlockPattern XENTEST`: neither XEN11 nor XUNI[0-9] is in the digest.
+        sink.record(&find(1000, "abcXENTESTdef"));
+
+        assert_eq!(
+            journal.appended()[0].kind,
+            FindKind::Xen11,
+            "a custom-pattern find must not inherit XUNI window/park semantics"
+        );
+    }
+
+    #[test]
+    fn a_digest_carrying_both_tokens_is_xuni_like_the_server() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Arc::new(RecordingJournal::default());
+        let state = Arc::new(MiningState::for_test(1000));
+        let sink = sink_with(journal.clone(), Arc::clone(&state), dir.path());
+
+        sink.record(&find(1000, "abcXEN11defXUNI3ghi"));
+
+        assert_eq!(
+            journal.appended()[0].kind,
+            FindKind::Xuni,
+            "gpage.py applies the XUNI window gate whenever XUNI[0-9] is present"
+        );
     }
 
     #[test]

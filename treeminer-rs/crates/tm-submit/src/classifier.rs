@@ -6,12 +6,18 @@
 //!        answers 200 even when its insert retries were exhausted (:492-494), so a 200 is
 //!        `AcceptedUnconfirmed` + a `/get_block` lookup, never a straight ack.
 //!   400  "Block already exists, continue" (:510) — UNIQUE-key duplicate: a prior attempt
-//!        landed, so confirm it the same way.
+//!        landed, so confirm it the same way. Also accepted on 409: the reference source
+//!        only ever emits 400, but a 2026 third-party client handles 409 as well, which
+//!        suggests production has drifted behind some proxy. Treating both as the duplicate
+//!        ack is safe — the confirmation lookup is what actually decides, and a wrong guess
+//!        here costs one `/get_block` and re-pends.
 //!   401  "Hash does not contain 'm={N}'. ..." (:416) — N is the server's CURRENT
 //!        difficulty, and the server check is strictly-`<`, so the find becomes valid
 //!        again once difficulty falls back to <= its m.
 //!   401  XUNI window rejections (:434 current, :497 legacy) — server-clock gated.
-//!   401  "Hash verification failed." (:519) — retrying cannot fix a bad payload.
+//!   4xx  TERMINAL rejections ([`TERMINAL_MARKERS`]) — malformed payloads and hashes the
+//!        server will refuse identically forever: retrying cannot fix them, so they land in
+//!        `PermanentlyInvalid` with the body preserved for diagnosis rather than looping.
 //!   429 / 408 / 425 / 5xx / transport failure / empty body — Pending with backoff.
 //!   anything else — Quarantined, never silently dropped.
 
@@ -240,6 +246,50 @@ pub fn parse_retry_after_seconds(header_value: &str) -> Option<i64> {
     Some(value)
 }
 
+/// Server responses that can NEVER succeed on retry. Each is verbatim from the reference
+/// server (line refs into `repos/xenminer/gpage.py`); the stored substring is the stable
+/// part of the message, because several of them interpolate server-side values.
+///
+/// The classifier only consults this table for a conclusive 4xx. A transport failure, a
+/// blank body or a 5xx is a statement about the SERVER, never about our payload, and those
+/// paths return `Pending` long before we get here — a terminal verdict must never be
+/// reachable from "the network was down".
+pub const TERMINAL_MARKERS: &[&str] = &[
+    "Invalid key format",                          // :391 (400)
+    "Invalid salt format",                         // :395 (400)
+    "Missing hash_to_verify, key, or account",     // :399 (400)
+    "Hash does not contain any of the valid targets", // :439 (401)
+    "should not be greater than 150 characters",   // :445 — full text names the length
+    "Hash verification failed",                    // :519 (401)
+];
+
+/// First [`TERMINAL_MARKERS`] entry the message carries, if any.
+pub fn terminal_marker(message: &str) -> Option<&'static str> {
+    TERMINAL_MARKERS
+        .iter()
+        .copied()
+        .find(|marker| message.contains(marker))
+}
+
+/// XUNI submitted outside the server-clock :55-:05 window (`:434` current wording, `:497`
+/// legacy). NOT permanent: the same find is valid in the next window, so it re-parks. The
+/// two loose forms catch a reworded message that keeps the same meaning.
+pub fn is_xuni_window_rejection(message: &str) -> bool {
+    message.contains("outside of proper time frame")
+        || message.contains("outside of time window")
+        || message.contains("time frame")
+        || message.contains("time window")
+}
+
+/// "Hash does not contain 'm={N}'" (:416). NOT permanent: the server test is strictly-`<`,
+/// so the find becomes valid again the moment difficulty falls back to <= its baked-in m.
+/// The loose form requires BOTH halves, so it cannot swallow the "valid targets" rejection
+/// (which is terminal and is checked first anyway).
+pub fn is_difficulty_mismatch(message: &str) -> bool {
+    message.contains("Hash does not contain 'm=")
+        || (message.contains("does not contain") && message.contains("m="))
+}
+
 fn pending(reason: String) -> Classification {
     Classification {
         next_status: FindStatus::Pending,
@@ -303,44 +353,56 @@ pub fn classify(
         ));
     }
 
-    if http_status == 400 {
-        if message.contains("already exists") {
-            return Classification {
-                next_status: FindStatus::AcceptedUnconfirmed,
-                server_difficulty_hint: None,
-                needs_lookup_confirmation: true,
-                reason: "duplicate key (already exists); confirming via /get_block".to_string(),
-            };
-        }
-        return quarantined(format!("unrecognized 400: {message}"));
+    // Accepted-as-duplicate. 400 is what the reference server emits; 409 is the semantically
+    // correct code and is handled because production may already answer it.
+    if (http_status == 400 || http_status == 409) && message.contains("already exists") {
+        return Classification {
+            next_status: FindStatus::AcceptedUnconfirmed,
+            server_difficulty_hint: None,
+            needs_lookup_confirmation: true,
+            reason: "duplicate key (already exists); confirming via /get_block".to_string(),
+        };
     }
 
-    if http_status == 401 {
-        if message.contains("Hash verification failed") {
+    // TERMINAL, before any of the retryable taxonomies: these responses describe our
+    // payload, not the server's mood, and resubmitting one forever is the failure mode this
+    // class exists to prevent. The whole message is preserved so the journal row and the
+    // operator log say exactly WHY a find was written off.
+    //
+    // Checked ahead of the difficulty test on purpose: "Hash does not contain any of the
+    // valid targets ..." shares the "does not contain" prefix with the difficulty rejection
+    // but is not fixable by waiting.
+    if let Some(marker) = terminal_marker(&message) {
+        return Classification {
+            next_status: FindStatus::PermanentlyInvalid,
+            server_difficulty_hint: None,
+            needs_lookup_confirmation: false,
+            reason: format!(
+                "server rejected permanently (http {http_status}, matched \"{marker}\"); \
+                 retrying cannot change this answer: {message}"
+            ),
+        };
+    }
+
+    if is_xuni_window_rejection(&message) {
+        if kind == FindKind::Xuni {
             return Classification {
-                next_status: FindStatus::PermanentlyInvalid,
+                next_status: FindStatus::ParkedXuniWindow,
                 server_difficulty_hint: None,
                 needs_lookup_confirmation: false,
-                reason: "server rejected: hash verification failed".to_string(),
+                reason: "XUNI outside server time window; parked for a later window".to_string(),
             };
         }
+        // docs/05 §2: a XEN11 submission can never receive this response. If it does,
+        // the server has changed — quarantine and make it loud.
+        return quarantined(format!(
+            "IMPOSSIBLE: XUNI-window rejection for a XEN11 record — server semantics changed, investigate: {message}"
+        ));
+    }
 
-        if message.contains("outside of proper time frame") || message.contains("outside of time window") {
-            if kind == FindKind::Xuni {
-                return Classification {
-                    next_status: FindStatus::ParkedXuniWindow,
-                    server_difficulty_hint: None,
-                    needs_lookup_confirmation: false,
-                    reason: "XUNI outside server time window; parked for a later window".to_string(),
-                };
-            }
-            // docs/05 §2: a XEN11 submission can never receive this response. If it does,
-            // the server has changed — quarantine and make it loud.
-            return quarantined(format!(
-                "IMPOSSIBLE: XUNI-window rejection for a XEN11 record — server semantics changed, investigate: {message}"
-            ));
-        }
-
+    // Difficulty mismatch: park until the floor falls, never a terminal verdict. The hint is
+    // the server's CURRENT difficulty, which the manager also feeds to the un-park path.
+    if is_difficulty_mismatch(&message) || http_status == 401 {
         if let Some(hint) = parse_difficulty_hint(&message) {
             return Classification {
                 next_status: FindStatus::ParkedDifficulty,
@@ -351,8 +413,6 @@ pub fn classify(
                 ),
             };
         }
-
-        return quarantined(format!("unrecognized 401: {message}"));
     }
 
     quarantined(format!(

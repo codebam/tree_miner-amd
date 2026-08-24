@@ -316,9 +316,14 @@ struct TransportState {
     submit_queue: Vec<TransportResult>,
     confirm_queue: Vec<TransportResult>,
     difficulty_queue: Vec<TransportResult>,
+    /// Only consulted once `health_enabled` is set; until then `health_probe` reports
+    /// `None`, exactly like a transport with no route distinct from `/difficulty`.
+    health_queue: Vec<TransportResult>,
+    health_enabled: bool,
     submitted_keys: Vec<String>,
     confirmed_keys: Vec<String>,
     difficulty_calls: i32,
+    health_calls: i32,
 }
 
 /// Scripted transport: each call pops the head of its queue, and an empty queue means the
@@ -340,6 +345,19 @@ impl FakeTransport {
     }
     pub fn push_difficulty(&self, r: TransportResult) {
         self.state.lock().expect("lock").difficulty_queue.push(r);
+    }
+    /// Turn on the dedicated health route (what `HttpTransport` does once it can derive a
+    /// port-4447 URL). Off by default so every pre-existing test keeps probing `/difficulty`.
+    pub fn enable_health_probe(&self) {
+        self.state.lock().expect("lock").health_enabled = true;
+    }
+    pub fn push_health(&self, r: TransportResult) {
+        let mut s = self.state.lock().expect("lock");
+        s.health_enabled = true;
+        s.health_queue.push(r);
+    }
+    pub fn health_calls(&self) -> i32 {
+        self.state.lock().expect("lock").health_calls
     }
     pub fn submitted_keys(&self) -> Vec<String> {
         self.state.lock().expect("lock").submitted_keys.clone()
@@ -374,6 +392,14 @@ impl Transport for FakeTransport {
         let mut s = self.state.lock().expect("lock");
         s.difficulty_calls += 1;
         take(&mut s.difficulty_queue)
+    }
+    fn health_probe(&self) -> Option<TransportResult> {
+        let mut s = self.state.lock().expect("lock");
+        if !s.health_enabled {
+            return None;
+        }
+        s.health_calls += 1;
+        Some(take(&mut s.health_queue))
     }
 }
 

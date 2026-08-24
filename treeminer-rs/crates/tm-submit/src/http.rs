@@ -10,12 +10,61 @@ use tm_core::FoundPayload;
 
 use crate::transport::{Transport, TransportResult};
 
+/// Port of the XenBlocks block-explorer API. Verified live: `GET /total_blocks` there
+/// answers 200 with a 27-byte `{"total_blocks":N}` body, and stayed up across every sample
+/// in which port 80 `/difficulty` timed out.
+pub const HEALTH_PROBE_PORT: u16 = 4447;
+/// Cheapest 200 on [`HEALTH_PROBE_PORT`]. Carries no difficulty — the manager harvests that
+/// separately, and treats a failed harvest as a non-event.
+pub const HEALTH_PROBE_PATH: &str = "/total_blocks";
+
+/// Build the breaker's health-probe URL from an arbitrary `rpc` base, or `None` when we
+/// cannot honestly guess one (the manager then probes `/difficulty` as before).
+///
+/// Rules, all deliberately conservative — a wrong guess here costs a wasted request on every
+/// probe of an outage:
+///   * only `http`/`https` bases are rewritten; anything else is left alone,
+///   * a base that already names an explicit port is NOT rewritten. The operator pointed at
+///     one specific service; silently probing a different port of their host would be us
+///     inventing infrastructure they never deployed,
+///   * the probe itself is issued over plain `http` even for an `https` base: port 4447 is
+///     a plaintext service on the reference deployment, and the probe carries no secrets
+///     (a `GET` with no credentials, whose only trusted output is "the host answered").
+pub fn derive_health_probe_url(rpc_link: &str) -> Option<String> {
+    let (scheme, rest) = rpc_link.trim().split_once("://")?;
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    // Authority ends at the first '/', '?' or '#'.
+    let authority = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    // Strip userinfo; a bare '@' with no host is malformed and falls out as empty below.
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    if host.is_empty() {
+        return None;
+    }
+    if let Some(close) = host.find(']') {
+        // IPv6 literal: a port can only appear after the closing bracket.
+        if !host.starts_with('[') || host[close + 1..].starts_with(':') {
+            return None;
+        }
+    } else if host.contains(':') {
+        return None; // explicit port
+    }
+    Some(format!("http://{host}:{HEALTH_PROBE_PORT}{HEALTH_PROBE_PATH}"))
+}
+
 pub struct HttpTransport {
     client: reqwest::blocking::Client,
     rpc: String,
     worker: String,
     submit_timeout: Duration,
     get_timeout: Duration,
+    /// `None` when the `rpc` base gave us nothing safe to derive; see
+    /// [`derive_health_probe_url`].
+    health_probe_url: Option<String>,
 }
 
 impl HttpTransport {
@@ -35,6 +84,7 @@ impl HttpTransport {
             worker: worker.to_string(),
             submit_timeout: Duration::from_millis(submit_timeout_ms),
             get_timeout: Duration::from_millis(get_timeout_ms),
+            health_probe_url: derive_health_probe_url(rpc_link),
         })
     }
 
@@ -105,5 +155,54 @@ impl Transport for HttpTransport {
                 .timeout(self.get_timeout)
                 .send(),
         )
+    }
+
+    fn health_probe(&self) -> Option<TransportResult> {
+        let url = self.health_probe_url.as_ref()?;
+        Some(Self::finish(
+            self.client.get(url).timeout(self.get_timeout).send(),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::derive_health_probe_url as d;
+
+    #[test]
+    fn derives_the_explorer_port_from_a_plain_base() {
+        assert_eq!(
+            d("http://xenblocks.io").as_deref(),
+            Some("http://xenblocks.io:4447/total_blocks")
+        );
+        // Trailing slash, path, query and fragment all stop at the authority.
+        assert_eq!(
+            d("https://xenblocks.io/").as_deref(),
+            Some("http://xenblocks.io:4447/total_blocks")
+        );
+        assert_eq!(
+            d("http://xenblocks.io/api/v1?x=1#f").as_deref(),
+            Some("http://xenblocks.io:4447/total_blocks")
+        );
+        assert_eq!(
+            d("http://user:pw@xenblocks.io").as_deref(),
+            Some("http://xenblocks.io:4447/total_blocks")
+        );
+        assert_eq!(
+            d("http://[2001:db8::1]").as_deref(),
+            Some("http://[2001:db8::1]:4447/total_blocks")
+        );
+    }
+
+    #[test]
+    fn declines_to_guess_when_the_base_is_not_a_plain_default_port_host() {
+        assert_eq!(d("http://localhost:8080"), None); // explicit port: operator's choice
+        assert_eq!(d("https://xenblocks.io:443"), None);
+        assert_eq!(d("http://[2001:db8::1]:9000"), None);
+        assert_eq!(d("ftp://xenblocks.io"), None);
+        assert_eq!(d("xenblocks.io"), None); // no scheme
+        assert_eq!(d("http://"), None);
+        assert_eq!(d("http:///difficulty"), None);
+        assert_eq!(d(""), None);
     }
 }

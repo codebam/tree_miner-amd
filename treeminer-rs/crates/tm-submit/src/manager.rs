@@ -60,7 +60,27 @@ pub struct Config {
     /// How often the auto ramp is re-evaluated. Auto mode reads journal counts, so this is
     /// deliberately coarse — the ramp moves on a 300 s scale, not a 250 ms one.
     pub margin_eval_interval_ms: i64,
+    /// Difficulty-transition quiesce: how long `/verify` stays paused after the observed
+    /// difficulty CHANGES. Finds keep being journaled throughout — the only thing that
+    /// pauses is the network round-trip. `0` disables it; values above
+    /// [`QUIESCE_MAX_MS`] are clamped down to it.
+    ///
+    /// Why: difficulty steps every 300 s, and the miner and the server do not step at the
+    /// same instant. Submitting across that boundary races — the operator's 20:12 logs show
+    /// a burst of 401s that were purely the transition, each one costing a round-trip, a
+    /// park and an un-park. Waiting a few seconds converts the whole burst into finds that
+    /// simply sit in the journal a moment longer, which is what the journal is for.
+    /// (`repos/xnminer-linux/core/supervisor.py:274-289` defers for `max(5, sample)` s for
+    /// the same reason.)
+    pub difficulty_quiesce_ms: i64,
 }
+
+/// Hard ceiling on [`Config::difficulty_quiesce_ms`]. A quiesce is a deliberate stall of the
+/// one path that gets finds paid for, so it is bounded twice over: the deadline is absolute
+/// (a monotonic timestamp computed once, never extended by the passage of time) and the
+/// configured duration cannot exceed this no matter what an operator types. A stuck quiesce
+/// is therefore not expressible.
+pub const QUIESCE_MAX_MS: i64 = 60_000;
 
 impl Default for Config {
     fn default() -> Self {
@@ -75,6 +95,7 @@ impl Default for Config {
             drain: DrainConfig::default(),
             margin: MarginConfig::default(),
             margin_eval_interval_ms: 5000,
+            difficulty_quiesce_ms: 5000,
         }
     }
 }
@@ -91,6 +112,10 @@ pub enum StepResult {
     BreakerBlocked,
     /// No submission was due, but confirmation retries were driven.
     ConfirmRetried,
+    /// Submissions are paused for a difficulty transition. Distinct from `Idle` so the
+    /// operator console (and the tests) can tell "nothing to do" from "deliberately
+    /// holding". Confirmation retries still ran; only `/verify` is held.
+    Quiescing,
 }
 
 /// How a `/get_block` 200 body relates to the record it is supposed to confirm. Anything but
@@ -128,6 +153,8 @@ pub struct Metrics {
     pub probes: u64,
     /// Headroom ramp steps taken.
     pub margin_changes: u64,
+    /// Difficulty transitions that armed a submission quiesce.
+    pub difficulty_quiesces: u64,
     /// `/get_block` 200s whose body failed validation: malformed, wrong key, mismatched hash.
     pub confirm_body_rejected: u64,
     /// Journal failures caught at the step boundary; >0 means the loop halted.
@@ -191,6 +218,11 @@ pub struct SubmissionManager<J: JournalAccess, T: Transport> {
     /// Latched the instant the breaker leaves Open, so a recovery log can still report how
     /// long the pool was down after the live clock has been reset.
     last_outage_span_ms: AtomicI64,
+    /// Monotonic deadline before which `/verify` is held for a difficulty transition; 0 =
+    /// not quiescing. An absolute instant rather than a countdown, and written from
+    /// `observe_difficulty` (which the difficulty poller calls on its own thread), so the
+    /// drain loop never blocks on it — it reads one atomic and returns.
+    quiesce_until_ms: AtomicI64,
     fatal: AtomicBool,
     running: AtomicBool,
     /// Only used to make `notify_find_appended` cheap; the loop also polls.
@@ -235,6 +267,7 @@ impl<J: JournalAccess, T: Transport> SubmissionManager<J, T> {
             margin_kib: AtomicU32::new(0),
             outage_started_ms: AtomicI64::new(0),
             last_outage_span_ms: AtomicI64::new(0),
+            quiesce_until_ms: AtomicI64::new(0),
             fatal: AtomicBool::new(false),
             running: AtomicBool::new(false),
             wake: (std::sync::Mutex::new(0), std::sync::Condvar::new()),
@@ -312,15 +345,47 @@ impl<J: JournalAccess, T: Transport> SubmissionManager<J, T> {
         self.last_outage_span_ms.load(Ordering::Relaxed)
     }
 
+    /// Milliseconds of difficulty-transition quiesce still to run, or 0 when submissions are
+    /// flowing. Bounded above by [`QUIESCE_MAX_MS`] by construction.
+    pub fn quiesce_remaining_ms(&self) -> i64 {
+        let until = self.quiesce_until_ms.load(Ordering::Relaxed);
+        if until == 0 {
+            return 0;
+        }
+        (until - (self.mono)()).max(0)
+    }
+
+    /// Arm the difficulty-transition quiesce. Idempotent and monotonic: concurrent observers
+    /// can only ever agree on the LATEST deadline, and every candidate deadline is
+    /// `now + <= QUIESCE_MAX_MS`, so no sequence of calls can push submissions out further
+    /// than one clamped quiesce from the last transition.
+    fn arm_quiesce(&self) {
+        let hold = self.cfg.difficulty_quiesce_ms.clamp(0, QUIESCE_MAX_MS);
+        if hold == 0 {
+            return; // disabled
+        }
+        let until = (self.mono)() + hold;
+        let previous = self.quiesce_until_ms.fetch_max(until, Ordering::Relaxed);
+        if previous >= until {
+            return; // an in-flight quiesce already covers this transition
+        }
+        self.shared.lock().metrics.difficulty_quiesces += 1;
+        tracing::info!(
+            hold_ms = hold,
+            "difficulty transition — pausing submissions briefly; finds keep queueing"
+        );
+    }
+
     // --- difficulty integration ---
 
     /// Called by the difficulty poller too, so trend tracking sees every sample.
     pub fn observe_difficulty(&self, difficulty: u32) -> JournalResult<usize> {
-        let (decreased, first_observation) = {
+        let (decreased, first_observation, changed) = {
             let mut shared = self.shared.lock();
             let previous = shared.last_difficulty;
             let mut decreased = false;
             let mut first = false;
+            let changed = previous.is_some_and(|prev| prev != difficulty);
             match previous {
                 Some(prev) => {
                     shared.trend = Some(if difficulty > prev {
@@ -335,8 +400,14 @@ impl<J: JournalAccess, T: Transport> SubmissionManager<J, T> {
                 None => first = true,
             }
             shared.last_difficulty = Some(difficulty);
-            (decreased, first)
+            (decreased, first, changed)
         };
+        // Only a real transition quiesces. The FIRST observation of a process must not: it
+        // carries no information about the server stepping, and stalling a just-started
+        // miner's backlog for nothing is the opposite of the point.
+        if changed {
+            self.arm_quiesce();
+        }
         // A falling floor re-qualifies parked finds with m >= current.
         //
         // The first observation of a process must un-park too, even though there is no trend
@@ -475,7 +546,9 @@ impl<J: JournalAccess, T: Transport> SubmissionManager<J, T> {
         // Confirmation retries run after the normal drain step and outside the drain-rate
         // budget, so a backlog of unconfirmed acks can never starve fresh submissions.
         let confirm_result = self.confirm_step(step, events)?;
-        if submit_result == StepResult::Idle && confirm_result != StepResult::Idle {
+        if matches!(submit_result, StepResult::Idle | StepResult::Quiescing)
+            && confirm_result != StepResult::Idle
+        {
             return Ok(confirm_result);
         }
         Ok(submit_result)
@@ -550,19 +623,24 @@ impl<J: JournalAccess, T: Transport> SubmissionManager<J, T> {
         }
     }
 
-    fn handle_difficulty_body(&self, body: &str, events: &mut Vec<Event>) -> JournalResult<()> {
-        // The reference server answers {"difficulty": "<N>"} — a JSON string.
+    /// `Ok(true)` when the body actually carried a difficulty we could record. The health
+    /// probe's body may legitimately carry none, which is why this reports rather than
+    /// silently no-ops.
+    fn handle_difficulty_body(&self, body: &str, events: &mut Vec<Event>) -> JournalResult<bool> {
+        // The reference server answers {"difficulty": "<N>"} — a JSON string. The
+        // leaderboard route embeds the same field in a much larger object, and
+        // `extract_json_field` scans top-level keys, so both parse here.
         let Some(field) = extract_json_field(body, "difficulty") else {
-            return Ok(());
+            return Ok(false);
         };
         // Reuse the bounded digit parser rather than a second integer parse.
         let Some(d) = parse_difficulty_hint(&format!("m={field}")) else {
-            return Ok(());
+            return Ok(false);
         };
         self.observe_difficulty(d)?;
         self.journal.record_difficulty(d, &iso_utc((self.wall)()))?;
         events.push(Event::DifficultyHint(d));
-        Ok(())
+        Ok(true)
     }
 
     fn backoff_time_iso(&self, attempt_count: i32, retry_after_s: Option<i64>) -> String {
@@ -605,17 +683,55 @@ impl<J: JournalAccess, T: Transport> SubmissionManager<J, T> {
         ConfirmBodyCheck::Confirmed
     }
 
+    /// A probe response only counts as "the host is alive" when it is a real, non-empty 200.
+    /// Same bar as everywhere else in this crate: an empty body is indistinguishable from a
+    /// proxy failure.
+    fn probe_response_healthy(r: &TransportResult) -> bool {
+        r.transport_ok && r.http_status == 200 && !r.body.trim().is_empty()
+    }
+
+    /// Breaker health probe.
+    ///
+    /// The route matters. Measured on the live network, `GET /difficulty` on port 80 timed
+    /// out on 6 of 14 requests while the explorer port answered every one — so probing
+    /// `/difficulty` alone made the breaker open on ordinary flakiness of the single least
+    /// reliable endpoint we touch, not on a real outage. A transport that offers
+    /// [`Transport::health_probe`] is asked there FIRST; `/difficulty` remains the fallback,
+    /// so the breaker only stays Open when BOTH routes are down.
+    ///
+    /// Difficulty is still harvested whenever it can be: the dedicated health route's body
+    /// carries none, so a successful probe follows up with `/difficulty` opportunistically.
+    /// That follow-up cannot un-heal the probe — health has already been proven, and a
+    /// difficulty we failed to read is a thing the poller and the next 401 hint both supply.
     fn probe_step(&self, step: &mut StepState, events: &mut Vec<Event>) -> JournalResult<StepResult> {
         if !step.breaker.probe_due() {
             return Ok(StepResult::Idle);
         }
-        let r = self.transport.difficulty();
-        self.track_server_date(&r);
         self.shared.lock().metrics.probes += 1;
-        if r.transport_ok && r.http_status == 200 && !r.body.trim().is_empty() {
-            self.handle_difficulty_body(&r.body, events)?;
+
+        let mut healthy = false;
+        let mut difficulty_seen = false;
+        let mut route = "/difficulty";
+        if let Some(h) = self.transport.health_probe() {
+            self.track_server_date(&h);
+            if Self::probe_response_healthy(&h) {
+                healthy = true;
+                route = "health";
+                difficulty_seen = self.handle_difficulty_body(&h.body, events)?;
+            }
+        }
+        if !healthy || !difficulty_seen {
+            let d = self.transport.difficulty();
+            self.track_server_date(&d);
+            if Self::probe_response_healthy(&d) {
+                healthy = true;
+                self.handle_difficulty_body(&d.body, events)?;
+            }
+        }
+
+        if healthy {
             step.breaker.on_probe_success(); // HalfOpen: next step admits one real submission
-            tracing::info!("submissions probing — difficulty probe succeeded, one test submit next");
+            tracing::info!(route, "submissions probing — probe succeeded, one test submit next");
         } else {
             step.breaker.on_probe_failure();
         }
@@ -637,6 +753,17 @@ impl<J: JournalAccess, T: Transport> SubmissionManager<J, T> {
             self.journal.unpark_xuni_for_window(self.cfg.xuni_max_windows)?;
         }
         step.last_window_open = window.open;
+
+        // Difficulty-transition quiesce. Deliberately AFTER the window bookkeeping above, so
+        // a quiesce that straddles :55 or :05 still records the transition and still un-parks
+        // XUNI — holding submissions must never also hold the schedule that decides what is
+        // submittable. Returning here is a plain early return: no sleeping, no lock held
+        // across a wait, so the drain thread keeps polling at its normal cadence and picks
+        // straight back up when the deadline passes. The breaker is untouched (a quiesce is
+        // not a failure) and so is the pacing gate, which simply finds itself already due.
+        if now_mono < self.quiesce_until_ms.load(Ordering::Relaxed) {
+            return Ok(StepResult::Quiescing);
+        }
 
         // Fetch per kind rather than taking one mixed oldest-first slice. A single LIMITed
         // slice lets either kind starve the other, and both directions are reachable:
