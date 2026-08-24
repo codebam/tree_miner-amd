@@ -1,0 +1,498 @@
+diff --git a/treeminer-rs/crates/tm-core/src/batch.rs b/treeminer-rs/crates/tm-core/src/batch.rs
+index 353ed1f..411a439 100644
+--- a/treeminer-rs/crates/tm-core/src/batch.rs
++++ b/treeminer-rs/crates/tm-core/src/batch.rs
+@@ -98,3 +98,202 @@ pub fn select_batch_size(
+     decision.selected_batch_size = decision.memory_limited_batch_size;
+     decision
+ }
++
++// --------------------------------------------------------------------- lane planning
++
++/// Difficulty at which one lane is expected to fill the whole VRAM budget on a large card.
++///
++/// Chosen to match the measured working point on an RX 7900 XTX: at m=1100 a single batch
++/// already consumes the entire post-reserve budget, so there is nothing left to hand a
++/// second lane. Below it the per-attempt cost falls linearly while the budget stays fixed.
++pub const DEFAULT_REFERENCE_DIFFICULTY: u32 = 1100;
++
++/// Default ceiling on concurrent lanes. Each lane is a separate pool plus a separate host
++/// thread, so the useful range is small; four matches the reference implementation.
++pub const DEFAULT_MAX_LANES: usize = 4;
++
++/// Floor for the per-lane runtime overhead charge on small cards.
++pub const LANE_OVERHEAD_FLOOR_BYTES: usize = 64 * 1024 * 1024;
++
++/// How many lanes to run and how big each one's batch is.
++///
++/// `batch_size_per_lane` is deliberately *identical* to what a single-lane plan would have
++/// selected: lanes replicate the tuned batch, they never shard it. Splitting one budget into
++/// N smaller batches (what the Python reference does) trades away per-batch efficiency for
++/// concurrency; replicating only ever uses headroom that the single-lane plan was leaving on
++/// the floor, which makes the "never worse than today" property structural rather than tuned.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct LanePlan {
++    /// Lanes to run. Always at least 1.
++    pub lanes: usize,
++    /// Batch size for each lane; equal to `decision.selected_batch_size`.
++    pub batch_size_per_lane: usize,
++    /// The unmodified single-lane decision this plan is built on.
++    pub decision: BatchSizeDecision,
++    /// Lanes the difficulty boost asked for, before the memory and cap clamps.
++    pub difficulty_boost: usize,
++    /// Lanes that actually fit in the post-reserve budget, including per-lane overhead.
++    pub memory_lane_limit: usize,
++}
++
++impl LanePlan {
++    /// Total attempts in flight across every lane.
++    #[must_use]
++    pub fn total_batch_size(&self) -> usize {
++        self.lanes.saturating_mul(self.batch_size_per_lane)
++    }
++
++    #[must_use]
++    pub fn is_single_lane(&self) -> bool {
++        self.lanes <= 1
++    }
++}
++
++/// Per-extra-lane runtime overhead, as a fraction of total VRAM.
++///
++/// Each additional lane brings its own stream, its own scratch and its own slice of runtime
++/// bookkeeping. The reference implementation budgets a flat ~2 GiB CUDA context on a 32 GiB
++/// card (~6.3% of total); expressing it as `total/16` keeps that proportion on an 8 GiB card
++/// instead of charging it an absolute 2 GiB it cannot afford, with a hard floor so a tiny
++/// card still charges something.
++#[must_use]
++pub fn lane_overhead_bytes(total_memory_bytes: usize) -> usize {
++    (total_memory_bytes / 16).max(LANE_OVERHEAD_FLOOR_BYTES)
++}
++
++/// Lanes that low difficulty justifies, before any memory or cap clamp.
++///
++/// `reference_difficulty / difficulty`, clamped to `[1, max_lanes]`. A difficulty at or above
++/// the reference yields exactly 1, so the plan collapses to today's behaviour as the network
++/// difficulty climbs. `reference_difficulty == 0` or `max_lanes <= 1` disables lanes entirely.
++#[must_use]
++pub fn difficulty_lane_boost(
++    difficulty: u32,
++    reference_difficulty: u32,
++    max_lanes: usize,
++) -> usize {
++    if max_lanes <= 1 || reference_difficulty == 0 || difficulty == 0 {
++        return 1;
++    }
++    if difficulty >= reference_difficulty {
++        return 1;
++    }
++    let boost = (reference_difficulty / difficulty) as usize;
++    boost.clamp(1, max_lanes)
++}
++
++/// Bytes one lane of `batch_size` attempts at `difficulty` occupies, allocator overhead
++/// included. Mirrors `estimate_memory_batch_limit`'s cost model exactly so the two can never
++/// disagree about what fits.
++fn lane_bytes(batch_size: usize, difficulty: u32) -> usize {
++    if batch_size == 0 || difficulty == 0 {
++        return 0;
++    }
++    let bytes = batch_size as f64 * difficulty as f64 * 1024.0 * 1.001;
++    bytes.ceil() as usize
++}
++
++/// Plans lanes and per-lane batch size for one difficulty.
++///
++/// Pure: no I/O, no globals, no GPU. `free_memory_bytes` and `total_memory_bytes` are the
++/// caller's most recent measurement; everything else is policy.
++///
++/// The rule is deliberately conservative. A second lane is only ever added when the
++/// single-lane batch was held back by something *other* than memory — the tuned ceilings in
++/// [`recommended_batch_size`] — because that is the only case where VRAM is genuinely sitting
++/// idle. When the single-lane batch is memory-limited (every difficulty above 64, which is
++/// every difficulty the live network has ever served, its floor being m=100) there is no
++/// headroom to give a second lane and the plan is exactly one lane at exactly today's batch
++/// size. See the module note on `plan_lanes` limits below.
++///
++/// An explicit `--max-batch-size` also pins the plan to one lane: that flag is an operator
++/// throttle, and quietly running it four times over would defeat the reason it was set.
++///
++/// # Key prefixes
++///
++/// The reference implementation gives each lane a distinct key prefix so lanes do not
++/// duplicate work. We deliberately do not, for two reasons.
++///
++/// First, it is unnecessary here. Upstream seeded `mt19937` from a single 32-bit value, so
++/// two lanes had a real chance of drawing the same key stream and a prefix was the cheap fix.
++/// `RandomHexKeyGenerator` seeds a 256-bit ChaCha state from OS entropy per instance
++/// (`tm-argon2/src/keygen.rs`), and each key is an independent draw over the 64-hex-character
++/// key space. Give every lane its own generator and the probability that any two lanes ever
++/// collide is not a design consideration.
++///
++/// Second, it would be actively wrong. The key prefix is not free space: `select_work` puts
++/// the dev-fee prefix or the operator's `self_mining_prefix` there, and the server attributes
++/// the find by it. A lane-index prefix would either be dropped (breaking the lane split) or
++/// prepended (misattributing the reward). Lanes must all carry the same prefix that
++/// `select_work` handed out, and rely on the generator for separation.
++#[must_use]
++pub fn plan_lanes(
++    runtime: GpuRuntimeKind,
++    free_memory_bytes: usize,
++    total_memory_bytes: usize,
++    difficulty: u32,
++    explicit_max_batch_size: usize,
++    max_lanes: usize,
++    reference_difficulty: u32,
++) -> LanePlan {
++    let decision = select_batch_size(
++        runtime,
++        free_memory_bytes,
++        difficulty,
++        explicit_max_batch_size,
++    );
++    let batch_size_per_lane = decision.selected_batch_size;
++    let single = LanePlan {
++        lanes: 1,
++        batch_size_per_lane,
++        decision,
++        difficulty_boost: 1,
++        memory_lane_limit: 1,
++    };
++    if batch_size_per_lane == 0 || explicit_max_batch_size > 0 {
++        return single;
++    }
++
++    let difficulty_boost = difficulty_lane_boost(difficulty, reference_difficulty, max_lanes);
++
++    // How many copies of this batch fit in the same budget the single-lane plan was allowed,
++    // charging every lane past the first for its own runtime overhead.
++    let reserve = effective_reserve_bytes(runtime, free_memory_bytes, DEFAULT_MEMORY_RESERVE_BYTES);
++    let budget = free_memory_bytes.saturating_sub(reserve);
++    let per_lane = lane_bytes(batch_size_per_lane, difficulty);
++    let overhead = lane_overhead_bytes(total_memory_bytes.max(free_memory_bytes));
++    let memory_lane_limit = if per_lane == 0 {
++        1
++    } else {
++        // L*per_lane + (L-1)*overhead <= budget  =>  L <= (budget + overhead)/(per_lane + overhead)
++        ((budget.saturating_add(overhead)) / (per_lane.saturating_add(overhead))).max(1)
++    };
++
++    LanePlan {
++        lanes: difficulty_boost.min(memory_lane_limit).max(1),
++        batch_size_per_lane,
++        decision,
++        difficulty_boost,
++        memory_lane_limit,
++    }
++}
++
++/// [`plan_lanes`] with the default lane cap and reference difficulty.
++#[must_use]
++pub fn plan_lanes_default(
++    runtime: GpuRuntimeKind,
++    free_memory_bytes: usize,
++    total_memory_bytes: usize,
++    difficulty: u32,
++    explicit_max_batch_size: usize,
++) -> LanePlan {
++    plan_lanes(
++        runtime,
++        free_memory_bytes,
++        total_memory_bytes,
++        difficulty,
++        explicit_max_batch_size,
++        DEFAULT_MAX_LANES,
++        DEFAULT_REFERENCE_DIFFICULTY,
++    )
++}
+diff --git a/treeminer-rs/crates/tm-core/tests/batch.rs b/treeminer-rs/crates/tm-core/tests/batch.rs
+index 16cc865..5cf756d 100644
+--- a/treeminer-rs/crates/tm-core/tests/batch.rs
++++ b/treeminer-rs/crates/tm-core/tests/batch.rs
+@@ -198,3 +198,286 @@ fn the_hip_reserve_only_changes_the_result_when_memory_binds() {
+         select_batch_size(HIP, free, 60000, 0).selected_batch_size
+     );
+ }
++
++// --------------------------------------------------------------------- lane planning
++
++use tm_core::batch::{
++    difficulty_lane_boost, lane_overhead_bytes, plan_lanes, plan_lanes_default, LanePlan,
++    DEFAULT_MAX_LANES, DEFAULT_REFERENCE_DIFFICULTY, LANE_OVERHEAD_FLOOR_BYTES,
++};
++
++/// Every VRAM size the operator or a plausible user actually has.
++const CARDS: [usize; 4] = [8 * GIB, 12 * GIB, 16 * GIB, 24 * GIB];
++
++/// Bytes a plan occupies, using the same cost model as `estimate_memory_batch_limit`.
++fn plan_bytes(plan: &LanePlan, difficulty: u32) -> f64 {
++    plan.total_batch_size() as f64 * difficulty as f64 * 1024.0 * 1.001
++}
++
++/// The budget a single-lane plan was allowed to fill.
++fn budget_bytes(runtime: GpuRuntimeKind, free: usize) -> f64 {
++    free.saturating_sub(effective_reserve_bytes(
++        runtime,
++        free,
++        DEFAULT_MEMORY_RESERVE_BYTES,
++    )) as f64
++}
++
++#[test]
++fn every_difficulty_the_live_network_serves_still_plans_exactly_one_lane() {
++    // The network floor is m=100 and it adjusts in steps of 1000/2000 from there. Above the
++    // tuned ceilings the single-lane batch is already memory-limited, so there is no idle
++    // VRAM to hand a second lane and the plan must be byte-for-byte today's behaviour.
++    for runtime in [CUDA, HIP] {
++        for &total in &CARDS {
++            for difficulty in [65u32, 100, 1100, 2100, 4100, 16100, 60000] {
++                let plan = plan_lanes_default(runtime, total, total, difficulty, 0);
++                assert_eq!(plan.lanes, 1, "{runtime:?} {total} m={difficulty}");
++                assert!(plan.is_single_lane());
++                assert_eq!(plan.memory_lane_limit, 1);
++                let today = select_batch_size(runtime, total, difficulty, 0);
++                assert_eq!(plan.decision, today);
++                assert_eq!(plan.batch_size_per_lane, today.selected_batch_size);
++                assert_eq!(plan.total_batch_size(), today.selected_batch_size);
++            }
++        }
++    }
++}
++
++#[test]
++fn a_free_pool_smaller_than_the_card_still_degrades_to_one_lane_at_live_difficulties() {
++    // Free is not total when a desktop is running: check the plan does not get adventurous
++    // just because the two differ.
++    for runtime in [CUDA, HIP] {
++        for difficulty in [100u32, 1100, 16100] {
++            let plan = plan_lanes_default(runtime, 20 * GIB, 24 * GIB, difficulty, 0);
++            assert_eq!(plan.lanes, 1, "{runtime:?} m={difficulty}");
++            assert_eq!(
++                plan.batch_size_per_lane,
++                select_batch_size(runtime, 20 * GIB, difficulty, 0).selected_batch_size
++            );
++        }
++    }
++}
++
++#[test]
++fn low_difficulty_scales_lanes_up_where_the_tuned_ceiling_leaves_vram_idle() {
++    // m<=64 is the one regime where the batch is capped by a hand-tuned constant rather than
++    // by memory: at m=64 one lane of 3072 attempts is ~200 MiB out of a 22 GiB budget.
++    for runtime in [CUDA, HIP] {
++        for &total in &CARDS {
++            for difficulty in [1u32, 8, 64] {
++                let plan = plan_lanes_default(runtime, total, total, difficulty, 0);
++                assert_eq!(
++                    plan.lanes, DEFAULT_MAX_LANES,
++                    "{runtime:?} {total} m={difficulty}"
++                );
++                // Per-lane batch is never shrunk to pay for the extra lanes.
++                assert_eq!(
++                    plan.batch_size_per_lane,
++                    recommended_batch_size(difficulty),
++                    "m={difficulty}"
++                );
++                assert!(plan.total_batch_size() > plan.decision.selected_batch_size);
++            }
++        }
++    }
++}
++
++#[test]
++fn the_lane_count_collapses_monotonically_as_difficulty_climbs() {
++    for runtime in [CUDA, HIP] {
++        let mut previous = usize::MAX;
++        for difficulty in [1u32, 8, 16, 32, 64, 65, 100, 275, 550, 1100, 16100] {
++            let lanes = plan_lanes_default(runtime, 24 * GIB, 24 * GIB, difficulty, 0).lanes;
++            assert!(
++                lanes <= previous,
++                "{runtime:?} m={difficulty}: {lanes} lanes after {previous}"
++            );
++            previous = lanes;
++        }
++        assert_eq!(previous, 1);
++    }
++}
++
++#[test]
++fn the_difficulty_boost_is_the_reference_over_the_difficulty_clamped_to_the_cap() {
++    assert_eq!(difficulty_lane_boost(1100, 1100, 4), 1);
++    assert_eq!(difficulty_lane_boost(1101, 1100, 4), 1);
++    assert_eq!(difficulty_lane_boost(550, 1100, 4), 2);
++    assert_eq!(difficulty_lane_boost(367, 1100, 4), 2); // 1100/367 == 2
++    assert_eq!(difficulty_lane_boost(366, 1100, 4), 3); // 1100/366 == 3
++    assert_eq!(difficulty_lane_boost(275, 1100, 4), 4);
++    assert_eq!(difficulty_lane_boost(100, 1100, 4), 4); // 11, clamped to the cap
++    assert_eq!(difficulty_lane_boost(1, 1100, 4), 4);
++    // Degenerate inputs never produce zero lanes or a division by zero.
++    assert_eq!(difficulty_lane_boost(0, 1100, 4), 1);
++    assert_eq!(difficulty_lane_boost(100, 0, 4), 1);
++    assert_eq!(difficulty_lane_boost(100, 1100, 1), 1);
++    assert_eq!(difficulty_lane_boost(100, 1100, 0), 1);
++}
++
++#[test]
++fn the_lane_cap_is_honoured_and_a_cap_of_one_reproduces_today_exactly() {
++    let free = 24 * GIB;
++    for max_lanes in [1usize, 2, 3, 4, 8, 16] {
++        let plan = plan_lanes(HIP, free, free, 8, 0, max_lanes, DEFAULT_REFERENCE_DIFFICULTY);
++        assert!(plan.lanes <= max_lanes.max(1), "cap {max_lanes}");
++        // m=8 asks for 1100/8 == 137 lanes, so the binding constraint is the cap until the
++        // cap passes what a 24 GiB card can hold (15 lanes, each charged 1.5 GiB overhead).
++        assert_eq!(
++            plan.lanes,
++            max_lanes.max(1).min(plan.memory_lane_limit),
++            "cap {max_lanes}"
++        );
++    }
++    // A cap of one is the kill switch: identical to `select_batch_size` at every difficulty.
++    for difficulty in [1u32, 8, 64, 100, 1100, 60000] {
++        let plan = plan_lanes(HIP, free, free, difficulty, 0, 1, DEFAULT_REFERENCE_DIFFICULTY);
++        assert_eq!(plan.lanes, 1);
++        assert_eq!(
++            plan.total_batch_size(),
++            select_batch_size(HIP, free, difficulty, 0).selected_batch_size
++        );
++    }
++}
++
++#[test]
++fn the_total_across_all_lanes_never_exceeds_the_single_lane_budget() {
++    // The invariant that keeps the ROCm GTT cliff out of reach: N lanes must fit in exactly
++    // the same post-reserve budget one lane was allowed, overhead included.
++    for runtime in [CUDA, HIP] {
++        for &total in &CARDS {
++            for free in [total, total * 3 / 4, total / 2, 2 * GIB, 512 * 1024 * 1024] {
++                for difficulty in [1u32, 8, 64, 65, 100, 275, 1100, 16100, 60000] {
++                    let plan = plan_lanes_default(runtime, free, total, difficulty, 0);
++                    let budget = budget_bytes(runtime, free).max(0.0);
++                    assert!(
++                        plan_bytes(&plan, difficulty) <= budget,
++                        "{runtime:?} total={total} free={free} m={difficulty}: \
++                         {} lanes x {} = {} bytes over budget {budget}",
++                        plan.lanes,
++                        plan.batch_size_per_lane,
++                        plan_bytes(&plan, difficulty)
++                    );
++                    // And never below what a single lane would have done.
++                    assert!(
++                        plan.total_batch_size()
++                            >= select_batch_size(runtime, free, difficulty, 0).selected_batch_size
++                    );
++                }
++            }
++        }
++    }
++}
++
++#[test]
++fn the_hip_reserve_still_binds_the_multi_lane_plan() {
++    // The gfx1100 cliff is a property of total device bytes in flight, so the HIP cushion has
++    // to survive lane multiplication. At m=60000 the plan is single-lane anyway; the check
++    // that matters is that HIP's aggregate stays under CUDA's at every difficulty.
++    let free = 24 * GIB;
++    for difficulty in [1u32, 8, 64, 100, 60000] {
++        let hip = plan_lanes_default(HIP, free, free, difficulty, 0);
++        let cuda = plan_lanes_default(CUDA, free, free, difficulty, 0);
++        assert!(
++            plan_bytes(&hip, difficulty) <= plan_bytes(&cuda, difficulty),
++            "m={difficulty}"
++        );
++        assert!(plan_bytes(&hip, difficulty) <= budget_bytes(HIP, free));
++    }
++    // The measured cliff itself: still 392, still one lane.
++    let hip = plan_lanes_default(HIP, free, free, 60000, 0);
++    assert_eq!(hip.lanes, 1);
++    assert_eq!(hip.total_batch_size(), 392);
++
++    // A 1 GiB card is entirely eaten by the HIP floor, so there is no lane to plan.
++    let starved = plan_lanes_default(HIP, GIB, GIB, 8, 0);
++    assert_eq!(starved.lanes, 1);
++    assert_eq!(starved.batch_size_per_lane, 0);
++    assert_eq!(starved.total_batch_size(), 0);
++}
++
++#[test]
++fn boundary_difficulties_around_the_tuned_ceilings() {
++    let free = 24 * GIB;
++    // 64 -> 65 is where the tuned ceiling disappears and memory takes over. The lane count
++    // has to fall off the same edge.
++    let inside = plan_lanes_default(HIP, free, free, 64, 0);
++    let outside = plan_lanes_default(HIP, free, free, 65, 0);
++    assert_eq!(inside.lanes, DEFAULT_MAX_LANES);
++    assert_eq!(inside.batch_size_per_lane, 3072);
++    assert_eq!(outside.lanes, 1);
++    assert_eq!(outside.batch_size_per_lane, outside.decision.memory_limited_batch_size);
++
++    // The 1->2 and 8->9 ceiling steps change the batch but not the lane count: all three are
++    // far enough under the memory limit that the cap is what binds.
++    for (difficulty, batch) in [(1u32, 2048usize), (2, 4096), (8, 4096), (9, 3072)] {
++        let plan = plan_lanes_default(HIP, free, free, difficulty, 0);
++        assert_eq!(plan.batch_size_per_lane, batch, "m={difficulty}");
++        assert_eq!(plan.lanes, DEFAULT_MAX_LANES, "m={difficulty}");
++    }
++}
++
++#[test]
++fn a_small_card_at_low_difficulty_is_limited_by_memory_not_by_the_boost() {
++    // 8 GiB under HIP: 1 GiB reserve, 7 GiB budget, and every extra lane is charged a
++    // 512 MiB overhead. There is still room for the full cap at m<=64.
++    let plan = plan_lanes_default(HIP, 8 * GIB, 8 * GIB, 8, 0);
++    assert_eq!(plan.lanes, DEFAULT_MAX_LANES);
++    assert!(plan.memory_lane_limit >= DEFAULT_MAX_LANES);
++
++    // Squeeze the budget until the overhead charge is what decides. 1.5 GiB free under HIP
++    // leaves 512 MiB after the floor, which is one lane's overhead: no second lane.
++    let squeezed = plan_lanes(HIP, 3 * GIB / 2, 8 * GIB, 8, 0, 4, DEFAULT_REFERENCE_DIFFICULTY);
++    assert!(squeezed.batch_size_per_lane > 0);
++    assert_eq!(squeezed.difficulty_boost, 4);
++    assert_eq!(squeezed.lanes, 1, "the overhead charge should have blocked lane 2");
++    assert_eq!(squeezed.memory_lane_limit, 1);
++}
++
++#[test]
++fn the_lane_overhead_is_proportional_with_a_floor_for_small_cards() {
++    assert_eq!(lane_overhead_bytes(24 * GIB), 24 * GIB / 16); // 1.5 GiB
++    assert_eq!(lane_overhead_bytes(16 * GIB), GIB);
++    assert_eq!(lane_overhead_bytes(12 * GIB), 12 * GIB / 16); // 768 MiB
++    assert_eq!(lane_overhead_bytes(8 * GIB), 512 * 1024 * 1024);
++    // Below 1 GiB total the proportional share is under the floor.
++    assert_eq!(lane_overhead_bytes(512 * 1024 * 1024), LANE_OVERHEAD_FLOOR_BYTES);
++    assert_eq!(lane_overhead_bytes(0), LANE_OVERHEAD_FLOOR_BYTES);
++}
++
++#[test]
++fn an_explicit_maximum_batch_size_pins_the_plan_to_one_lane() {
++    // `--max-batch-size` is an operator throttle (thermals, a shared desktop). Running it on
++    // four lanes would quietly undo the throttle.
++    let free = 24 * GIB;
++    for difficulty in [1u32, 8, 64, 100] {
++        let plan = plan_lanes_default(HIP, free, free, difficulty, 512);
++        assert_eq!(plan.lanes, 1, "m={difficulty}");
++        assert_eq!(plan.batch_size_per_lane, 512);
++        assert!(plan.decision.explicit_limit_applied);
++    }
++}
++
++#[test]
++fn degenerate_inputs_never_panic_or_produce_zero_lanes() {
++    for runtime in [CUDA, HIP] {
++        for free in [0usize, 1, GIB, 24 * GIB] {
++            for total in [0usize, 1, free, 24 * GIB] {
++                for difficulty in [0u32, 1, 60000, u32::MAX] {
++                    for max_lanes in [0usize, 1, 4, usize::MAX] {
++                        let plan = plan_lanes(runtime, free, total, difficulty, 0, max_lanes, 1100);
++                        assert!(plan.lanes >= 1);
++                        assert_eq!(plan.batch_size_per_lane, plan.decision.selected_batch_size);
++                        assert!(plan.total_batch_size() >= plan.batch_size_per_lane);
++                    }
++                }
++            }
++        }
++    }
++    // A reference difficulty of zero disables the boost without disabling mining.
++    let plan = plan_lanes(HIP, 24 * GIB, 24 * GIB, 8, 0, 4, 0);
++    assert_eq!(plan.lanes, 1);
++    assert_eq!(plan.batch_size_per_lane, 4096);
++}

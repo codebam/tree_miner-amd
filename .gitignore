@@ -15,3 +15,12 @@ build/
 build-*/
 runtime-*/
 dist/
+
+# Miner runtime artifacts (created in the working directory at run time)
+treeminer-journal.db
+treeminer-journal.db-shm
+treeminer-journal.db-wal
+difficulty.cache
+dashboard.url
+log0.txt
+log1.txt
