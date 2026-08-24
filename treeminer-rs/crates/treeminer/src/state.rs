@@ -388,21 +388,76 @@ impl FindClass {
 }
 
 /// Classify a find from its bare base64 digest.
+///
+/// THE SAME ORDER `FindSink::payload_for` USES, AND FOR THE SAME REASON.
+/// `gpage.py:429-437` tests `XUNI[0-9]` first and routes a match down the XUNI path
+/// whatever else the digest contains, so a digest carrying BOTH tokens is a XUNI find to
+/// the server. This used to read `digest.contains("XEN11")` first, which labelled such a
+/// find "normal" (or even "superblock") while the journal recorded it as `FindKind::Xuni`
+/// — a dashboard that disagrees with the journal about the same row.
+///
+/// A XUNI find is never credited a superblock either: `utils/gen_balances.py:119-124` puts
+/// the XBLK credit inside the XEN branch, and `make_superblocks.py` counts capitals over
+/// the `blocks` table, which XUNI rows never enter. So the XUNI arm returns before the
+/// capital count is even looked at.
+///
+/// The remaining fallback is Normal/Superblock rather than Xuni, which also fixes a
+/// `--testBlockPattern` find (neither token present): it is submitted as `Xen11`, and it is
+/// now counted as one.
 pub fn classify_find(digest: &str) -> FindClass {
-    if digest.contains("XEN11") {
-        if tm_core::is_superblock_hash(digest) {
-            FindClass::Superblock
-        } else {
-            FindClass::Normal
-        }
+    if tm_core::has_xuni_match(digest) {
+        return FindClass::Xuni;
+    }
+    if tm_core::is_superblock_hash(digest) {
+        FindClass::Superblock
     } else {
-        FindClass::Xuni
+        FindClass::Normal
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 50 capitals is the superblock threshold; `tail` is appended so a token can be added
+    /// without disturbing the count.
+    fn capitals(count: usize, tail: &str) -> String {
+        format!("{}{tail}", "A".repeat(count))
+    }
+
+    #[test]
+    fn the_console_label_agrees_with_the_kind_the_journal_records() {
+        assert_eq!(classify_find("abcXEN11def"), FindClass::Normal);
+        assert_eq!(classify_find("abcXUNI7def"), FindClass::Xuni);
+        // `XUNI` without a digit is not the server's XUNI regex.
+        assert_eq!(classify_find("abcXUNIdef"), FindClass::Normal);
+        // `--testBlockPattern`: neither token. Submitted as Xen11, so counted as one.
+        assert_eq!(classify_find("abcXENTESTdef"), FindClass::Normal);
+    }
+
+    #[test]
+    fn a_digest_carrying_both_tokens_is_counted_as_xuni() {
+        // gpage.py:429-437 routes on XUNI[0-9] first, whatever else is in the digest.
+        assert_eq!(classify_find("abcXEN11defXUNI3ghi"), FindClass::Xuni);
+    }
+
+    #[test]
+    fn a_xuni_find_is_never_credited_a_superblock() {
+        let many_capitals = capitals(60, "XUNI3");
+        assert!(tm_core::is_superblock_hash(&many_capitals));
+        assert_eq!(
+            classify_find(&many_capitals),
+            FindClass::Xuni,
+            "gen_balances.py credits XBLK only inside the XEN branch, and make_superblocks \
+             counts over the blocks table, which XUNI rows never enter"
+        );
+    }
+
+    #[test]
+    fn fifty_capitals_in_a_xen_digest_is_a_superblock() {
+        assert_eq!(classify_find(&capitals(50, "XEN11")), FindClass::Superblock);
+        assert_eq!(classify_find(&capitals(10, "XEN11")), FindClass::Normal);
+    }
 
     #[test]
     fn margin_is_added_to_the_mined_memory_cost() {

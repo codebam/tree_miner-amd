@@ -311,6 +311,65 @@ fn cpu_max_difficulty_is_bounded() {
 }
 
 #[test]
+fn difficulty_quiesce_is_bounded_and_defaults_to_the_submitter_s_own_default() {
+    let fixture = Fixture::new();
+    assert_eq!(
+        fixture.resolve(&[]).expect("resolve").difficulty_quiesce_ms,
+        tm_submit::Config::default().difficulty_quiesce_ms,
+        "the operator default must not drift from the submitter's compiled-in one"
+    );
+    assert_eq!(
+        fixture
+            .resolve(&["--difficultyQuiesceMs", "0"])
+            .expect("resolve")
+            .difficulty_quiesce_ms,
+        0,
+        "0 must reach the submitter intact: it is how the hold is disabled"
+    );
+    assert_eq!(
+        fixture
+            .resolve(&["--difficultyQuiesceMs", "60000"])
+            .expect("resolve")
+            .difficulty_quiesce_ms,
+        tm_submit::QUIESCE_MAX_MS
+    );
+    assert_eq!(
+        fixture.resolve(&["--difficultyQuiesceMs", "-1"]).unwrap_err().to_string(),
+        "The argument (-1) for the difficulty quiesce must be 0-60000 ms."
+    );
+    // Above the submitter's ceiling is refused here rather than silently clamped there, so
+    // an operator who typed a minute-and-a-half learns that the miner will not do it.
+    assert_eq!(
+        fixture.resolve(&["--difficultyQuiesceMs", "90000"]).unwrap_err().to_string(),
+        "The argument (90000) for the difficulty quiesce must be 0-60000 ms."
+    );
+}
+
+/// Setting it announces itself at startup, as every other overridden numeric option does.
+#[test]
+fn an_overridden_quiesce_is_reported_in_the_startup_banner() {
+    let fixture = Fixture::new();
+    let resolved = fixture.resolve(&["--difficultyQuiesceMs", "9000"]).expect("resolve");
+    assert!(
+        resolved.startup_messages.iter().any(|line| line.contains("Difficulty quiesce: 9000 ms")),
+        "startup messages were {:?}",
+        resolved.startup_messages
+    );
+    let off = fixture.resolve(&["--difficultyQuiesceMs", "0"]).expect("resolve");
+    assert!(off
+        .startup_messages
+        .iter()
+        .any(|line| line.contains("Difficulty quiesce: disabled")));
+    // Untouched, it stays quiet: the banner reports overrides, not defaults.
+    assert!(!fixture
+        .resolve(&[])
+        .expect("resolve")
+        .startup_messages
+        .iter()
+        .any(|line| line.contains("Difficulty quiesce")));
+}
+
+#[test]
 fn margin_mode_rejects_a_typo_with_the_cpp_message() {
     let fixture = Fixture::new();
     assert_eq!(

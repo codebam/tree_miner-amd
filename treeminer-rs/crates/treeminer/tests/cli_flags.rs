@@ -58,6 +58,8 @@ fn every_option_from_the_cpp_block_is_present() {
         "4",
         "--cpuMaxDifficulty",
         "250",
+        "--difficultyQuiesceMs",
+        "7000",
         "--dashboard-bind",
         "127.0.0.1",
         "--dashboard-port",
@@ -88,6 +90,7 @@ fn every_option_from_the_cpp_block_is_present() {
     assert_eq!(cli.gpu_streams, Some(2));
     assert_eq!(cli.cpu_workers, Some(4));
     assert_eq!(cli.cpu_max_difficulty, Some(250));
+    assert_eq!(cli.difficulty_quiesce_ms, Some(7000));
     assert_eq!(cli.dashboard_bind.as_deref(), Some("127.0.0.1"));
     assert_eq!(cli.dashboard_port, Some(8080));
     assert_eq!(cli.display.as_deref(), Some("logs"));
@@ -173,6 +176,7 @@ fn help_lists_every_flag() {
         "--gpuStreams",
         "--cpuWorkers",
         "--cpuMaxDifficulty",
+        "--difficultyQuiesceMs",
         "--dashboard-bind",
         "--dashboard-port",
         "--display",

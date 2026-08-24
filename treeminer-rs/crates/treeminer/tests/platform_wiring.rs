@@ -246,7 +246,8 @@ fn sink_with(
         Arc::clone(state),
         WORKER,
     )
-    .with_clock(|| "2026-01-01T00:00:00Z".to_owned());
+    .with_clock(|| "2026-01-01T00:00:00Z".to_owned())
+    .trusting_digests();
     if let Some(observer) = observer {
         sink = sink.with_observer(observer);
     }

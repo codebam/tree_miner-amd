@@ -410,6 +410,7 @@ fn build_submitter(
     let bridge = Arc::new(JournalBridge::new(Arc::clone(&journal)));
     let submit_config = tm_submit::Config {
         margin: config.margin,
+        difficulty_quiesce_ms: config.difficulty_quiesce_ms,
         ..tm_submit::Config::default()
     };
 
@@ -574,6 +575,33 @@ fn last_submission_for(status: tm_core::FindStatus) -> tm_dashboard::stats::Last
     }
 }
 
+/// The difficulty poller's observer body: hand the observation to the submitter, then
+/// publish the server-clock offset the submitter has learned from HTTP `Date` headers.
+///
+/// WHY THE PUBLISH LIVES HERE.
+/// `clock::now_server_ms` is what both the mining loop's XUNI gate and the submitter's
+/// window check read, but nothing was ever calling `set_server_offset_ms`, so both sides
+/// fell back to plain UTC — self-consistent, and wrong by whatever the server's clock skew
+/// actually is. `SubmissionManager` is the only thing that learns the offset, and this is
+/// the only place in the miner that holds an `Arc<Manager>` on a repeating schedule
+/// *without* being one of the manager's own callbacks (a callback capturing the manager
+/// would be a reference cycle, and the callbacks fire only when there is queued work — a
+/// rig between finds would never refresh).
+///
+/// The poller fires every `difficulty::POLL_INTERVAL` (10 s) unconditionally, plus once
+/// synchronously before any mining thread exists. Clock skew moves on the scale of NTP
+/// drift, so a 10 s refresh is far tighter than the quantity being tracked; the ~1 s stats
+/// snapshot would be marginally prompter but is a *getter* the dashboard calls, and a
+/// process-global write hidden in it would fire from whichever thread happened to render.
+pub fn observe_difficulty_and_clock<J, T>(manager: &SubmissionManager<J, T>, difficulty: u32)
+where
+    J: tm_submit::JournalAccess,
+    T: tm_submit::Transport,
+{
+    let _ = manager.observe_difficulty(difficulty);
+    crate::clock::set_server_offset_ms(manager.server_clock_offset_ms());
+}
+
 /// Poll `/difficulty` forever, feeding both the mining loop and the submitter's unparking.
 fn spawn_difficulty_poller(
     config: &ResolvedConfig,
@@ -597,7 +625,7 @@ fn spawn_difficulty_poller(
         // network has since caught up with, and what feeds the trend the margin ramp uses.
         let manager = Arc::clone(manager);
         poller = poller.with_observer(move |difficulty| {
-            let _ = manager.observe_difficulty(difficulty);
+            observe_difficulty_and_clock(manager.as_ref(), difficulty);
         });
     }
     // The first poll happens on this thread, as in the C++, so a reachable server has

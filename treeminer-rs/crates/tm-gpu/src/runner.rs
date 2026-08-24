@@ -158,6 +158,15 @@ impl KernelRunner {
             .ok_or_else(|| GpuError::Invalid(format!("job {job_id} is outside the batch")))
     }
 
+    /// The final Argon2 blocks of the first `jobs` jobs as one contiguous slice, so the
+    /// finalize pass can split them across threads instead of borrowing the runner once per
+    /// job. The counterpart of [`Self::input_blocks_batch_mut`].
+    pub fn output_blocks(&self, jobs: usize) -> Result<&[u8]> {
+        self.blocks_out
+            .get(..jobs * ARGON2_BLOCK_SIZE)
+            .ok_or_else(|| GpuError::Invalid(format!("batch of {jobs} is outside the pool")))
+    }
+
     /// Stages passwords and salt on the device so the next `run` derives the first blocks
     /// there instead of copying them up.
     ///

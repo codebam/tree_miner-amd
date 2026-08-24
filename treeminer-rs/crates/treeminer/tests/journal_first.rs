@@ -86,7 +86,9 @@ fn rig() -> Rig {
         Arc::clone(&state),
         "worker-1",
     )
-    .with_clock(|| "2026-01-01T00:00:00Z".to_owned());
+    .with_clock(|| "2026-01-01T00:00:00Z".to_owned())
+    // Hand-written digests: the CPU cross-check is unit-tested in `find.rs`.
+    .trusting_digests();
     let server = Arc::new(FakeServer::default());
     let manager = Arc::new(SubmissionManager::new(
         Arc::new(JournalBridge::new(Arc::clone(&journal))),
@@ -232,7 +234,8 @@ fn a_xuni_find_survives_a_restart_of_the_process() {
             Arc::clone(&state),
             "worker-1",
         )
-        .with_clock(|| "2026-01-01T00:00:00Z".to_owned());
+        .with_clock(|| "2026-01-01T00:00:00Z".to_owned())
+        .trusting_digests();
         sink.record(&find(1000, "aaaXUNI7bbb"));
     }
 

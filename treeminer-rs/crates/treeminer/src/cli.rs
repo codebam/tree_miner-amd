@@ -115,6 +115,11 @@ pub struct Cli {
     #[arg(long = "cpuMaxDifficulty", value_name = "int")]
     pub cpu_max_difficulty: Option<i32>,
 
+    /// pause /verify for this many ms after the observed difficulty changes, so finds are
+    /// not submitted across the transition (default 5000; 0 disables; max 60000)
+    #[arg(long = "difficultyQuiesceMs", value_name = "int")]
+    pub difficulty_quiesce_ms: Option<i32>,
+
     /// dashboard listen IP (default: 0.0.0.0 for Vast.ai/Docker/LAN; 127.0.0.1 for this
     /// machine only)
     #[arg(long = "dashboard-bind", value_name = "string")]

@@ -8,7 +8,16 @@
 //!    memory cost travels with the find from the moment it is discovered and is never
 //!    recomputed.
 //!
-//! 2. **Durability precedes the network.** Every find is appended to the journal before any
+//! 2. **Every find is re-hashed on the CPU before it is believed.** The GPU is the one
+//!    component here whose arithmetic nobody can inspect: commit `12e241c` in this project's
+//!    own history is an nvcc miscompile that produced *invalid Argon2 digests*, and the fork
+//!    later dropped upstream's per-find re-hash, leaving the startup self-test as the only
+//!    guard. Upstream Woody (`src/main.cpp:377-381`) and the 2026 client xnminer
+//!    (`mining/argon2_common.py:54-90`) both re-verify every find on the CPU before
+//!    submitting it. So does this. A find whose CPU digest differs is dropped, loudly, and
+//!    never reaches the journal.
+//!
+//! 3. **Durability precedes the network.** Every find is appended to the journal before any
 //!    HTTP attempt. If the journal write fails the find goes to an append-only fsync'd
 //!    fallback sink whose failure domain is deliberately disjoint from SQLite's, and the
 //!    next boot imports it back. If *both* fail, the miner is destroying every future find
@@ -46,15 +55,58 @@ pub enum Capture {
     Journaled(i64),
     /// In the fallback sink; the next boot imports it.
     Fallback,
+    /// Deliberately nowhere: the CPU re-hash did not reproduce the GPU's digest, so the
+    /// find is a false positive and submitting it would earn a 401 at best. Not a
+    /// durability failure — nothing was lost that was ever real.
+    Rejected,
     /// Nowhere. Fatal: declared as such before this is returned.
     Lost,
 }
 
 impl Capture {
     pub fn is_durable(self) -> bool {
-        !matches!(self, Capture::Lost)
+        matches!(self, Capture::Journaled(_) | Capture::Fallback)
     }
 }
+
+/// What the CPU said about a GPU digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Verification {
+    /// The CPU reproduced the digest exactly.
+    Match,
+    /// The CPU produced a DIFFERENT digest for the same salt, key and `m`. Either the
+    /// device's arithmetic or the memory holding its output is wrong.
+    Mismatch { cpu_digest: String },
+    /// The check could not be run — the parameters are outside what the CPU
+    /// implementation accepts (`m < 8`, a malformed salt). NEVER a reason to drop a find:
+    /// "I could not check this" and "this is wrong" are different statements, and only the
+    /// second one justifies destroying a block.
+    Unavailable(String),
+}
+
+/// Re-hash a find on the CPU and compare digests. The production [`DigestVerifier`].
+///
+/// COST. One Argon2id pass at the find's own memory cost: microseconds at `m=100`,
+/// tens of milliseconds at `m=60000`. Finds arrive minutes-to-hours apart on a real rig, so
+/// this is a rounding error against the millions of hashes that produced the find, and it
+/// is deliberately NOT bounded by difficulty — a cap would switch the guard off at exactly
+/// the memory costs where a miscompiled kernel is most expensive. (The one workload that
+/// makes finds cheap is `--testBlockPattern` with a short pattern, where every batch
+/// "finds" something; that path is slowed, not wedged, and it is a test mode.)
+pub fn cpu_verify(find: &Find) -> Verification {
+    let phc = match tm_argon2::argon2id_phc(&find.hexsalt, &find.key, find.memory_cost) {
+        Ok(phc) => phc,
+        Err(error) => return Verification::Unavailable(error.to_string()),
+    };
+    match tm_core::phc_digest(&phc) {
+        Some(digest) if digest == find.digest => Verification::Match,
+        Some(digest) => Verification::Mismatch { cpu_digest: digest.to_owned() },
+        None => Verification::Unavailable("CPU produced an unparseable PHC string".to_owned()),
+    }
+}
+
+/// How a find's digest is checked before it is believed. Swapped out only by tests.
+pub type DigestVerifier = Arc<dyn Fn(&Find) -> Verification + Send + Sync>;
 
 /// Called after a find is durably journaled, so the submitter can wake its drain loop
 /// instead of waiting out an idle poll.
@@ -78,6 +130,8 @@ pub struct FindSink {
     logger: Option<Arc<FileLogger>>,
     notifier: Option<FindNotifier>,
     observer: Option<FindObserver>,
+    /// The CPU cross-check every find has to pass. [`cpu_verify`] in production.
+    verifier: DigestVerifier,
     /// Injected so tests do not depend on the wall clock.
     now_utc: Box<dyn Fn() -> String + Send + Sync>,
 }
@@ -106,6 +160,7 @@ impl FindSink {
             logger: None,
             notifier: None,
             observer: None,
+            verifier: Arc::new(cpu_verify),
             now_utc: Box::new(|| {
                 tm_submit::iso_utc(tm_submit::clocktime::now_wall_ms())
             }),
@@ -125,6 +180,19 @@ impl FindSink {
     pub fn with_observer(mut self, observer: FindObserver) -> Self {
         self.observer = Some(observer);
         self
+    }
+
+    /// Replace the CPU cross-check. The only production verifier is [`cpu_verify`]; this
+    /// exists so tests can drive the mismatch path (and so the many tests that use
+    /// hand-written digests are not required to invent real Argon2 preimages).
+    pub fn with_verifier(mut self, verifier: DigestVerifier) -> Self {
+        self.verifier = verifier;
+        self
+    }
+
+    /// Test-only: accept every digest without re-hashing it.
+    pub fn trusting_digests(self) -> Self {
+        self.with_verifier(Arc::new(|_find| Verification::Match))
     }
 
     /// Fixed timestamps for tests.
@@ -185,6 +253,10 @@ impl FindSink {
             }
         };
 
+        if let Some(capture) = self.reject_if_unverified(find) {
+            return capture;
+        }
+
         let capture = self.persist(&payload);
         self.account(find, &payload, capture);
         if let (Capture::Journaled(_), Some(notifier)) = (capture, &self.notifier) {
@@ -196,6 +268,55 @@ impl FindSink {
             observer(find, &payload);
         }
         capture
+    }
+
+    /// Run the CPU cross-check. `Some(Capture::Rejected)` means the find is a false
+    /// positive and this function has already reported it; `None` means carry on.
+    ///
+    /// A verifier that cannot answer (`Unavailable`) lets the find through with a warning:
+    /// the whole point of the journal is that a real find is never destroyed, and "the CPU
+    /// refused these parameters" is not evidence that the GPU was wrong.
+    fn reject_if_unverified(&self, find: &Find) -> Option<Capture> {
+        match (self.verifier)(find) {
+            Verification::Match => None,
+            Verification::Unavailable(reason) => {
+                Console::global().event(
+                    Level::Warn,
+                    "VERIFY",
+                    &format!(
+                        "CPU re-check unavailable for a {} find at m={} | {reason} — \
+                         submitting it unchecked",
+                        find.source, find.memory_cost
+                    ),
+                );
+                self.log(&format!(
+                    "verify SKIPPED source={} m={} reason={reason}",
+                    find.source, find.memory_cost
+                ));
+                None
+            }
+            Verification::Mismatch { cpu_digest } => {
+                // Loud on purpose. One of these is a bad batch; a run of them is a broken
+                // kernel, a broken driver or dying VRAM, and the operator has to see it —
+                // this is exactly the failure mode of commit 12e241c, which mined nothing
+                // valid for as long as it was believed.
+                Console::global().event(
+                    Level::Error,
+                    "VERIFY",
+                    &format!(
+                        "FALSE POSITIVE DROPPED  \u{2022}  {}  \u{2022}  m={}  \u{2022}  the CPU \
+                         re-hash does not match this device's digest — check the GPU, its \
+                         driver and its memory",
+                        find.source, find.memory_cost
+                    ),
+                );
+                self.log(&format!(
+                    "found DROPPED source={} m={} reason=cpu-reverify-mismatch gpu={} cpu={}",
+                    find.source, find.memory_cost, find.digest, cpu_digest
+                ));
+                Some(Capture::Rejected)
+            }
+        }
     }
 
     /// Journal, then fallback sink, then fatal.
@@ -250,7 +371,7 @@ impl FindSink {
         let id = match capture {
             Capture::Journaled(id) => id.to_string(),
             Capture::Fallback => "fallback".to_owned(),
-            Capture::Lost => "none".to_owned(),
+            Capture::Rejected | Capture::Lost => "none".to_owned(),
         };
         self.log(&format!(
             "found id={id} source={} kind={} mined_m={} {}",
@@ -274,6 +395,9 @@ impl FindSink {
         message.push_str(match capture {
             Capture::Journaled(_) => "  \u{2022}  saved locally  \u{2022}  queued",
             Capture::Fallback => "  \u{2022}  saved to fallback",
+            // Reported by `reject_if_unverified` before `account` is reached; listed so the
+            // match stays total if that ever changes.
+            Capture::Rejected => "  \u{2022}  DROPPED  \u{2022}  failed CPU re-verification",
             // Must not read as "handled": nothing durable holds this find and the fatal
             // state declared above is about to take the miner down.
             Capture::Lost => "  \u{2022}  SAVE FAILED  \u{2022}  stopping",
@@ -282,7 +406,7 @@ impl FindSink {
             match capture {
                 Capture::Journaled(_) => Level::Found,
                 Capture::Fallback => Level::Warn,
-                Capture::Lost => Level::Error,
+                Capture::Rejected | Capture::Lost => Level::Error,
             },
             payload.kind.as_str(),
             &message,
@@ -334,6 +458,9 @@ mod tests {
             "worker-1",
         )
         .with_clock(|| "2026-01-01T00:00:00Z".to_owned())
+        // These finds carry hand-written digests, not real Argon2 output; the CPU
+        // cross-check has its own tests below.
+        .trusting_digests()
     }
 
     #[test]
@@ -403,7 +530,8 @@ mod tests {
             FallbackSink::new(blocked),
             Arc::clone(&state),
             "worker-1",
-        );
+        )
+        .trusting_digests();
 
         assert_eq!(sink.record(&find(1000, "abcXEN11def")), Capture::Lost);
         assert!(state.fatal_durability_failure());
@@ -476,6 +604,108 @@ mod tests {
             FindKind::Xuni,
             "gpage.py applies the XUNI window gate whenever XUNI[0-9] is present"
         );
+    }
+
+    // --- CPU re-verification (the 12e241c guard) ---
+
+    /// A real Argon2 digest for the fixture's salt and key, at the given memory cost.
+    fn real_digest(memory_cost: u32) -> String {
+        let phc = tm_argon2::argon2id_phc(
+            "e4bb184781bbc9c7004e8dafd4a9b49d203bc9bc",
+            "52a13632690c0d5a7e528c91c8462f9d68d24975d4f80cc64d20504063f3590f",
+            memory_cost,
+        )
+        .expect("cpu hash");
+        tm_core::phc_digest(&phc).expect("digest").to_owned()
+    }
+
+    #[test]
+    fn a_genuine_digest_passes_the_cpu_re_check() {
+        let genuine = find(8, &real_digest(8));
+        assert_eq!(cpu_verify(&genuine), Verification::Match);
+    }
+
+    #[test]
+    fn a_digest_the_cpu_cannot_reproduce_is_a_mismatch() {
+        // What an nvcc miscompile looked like in commit 12e241c: a plausible digest that no
+        // CPU run of the same parameters produces.
+        let bogus = find(8, "abcXEN11def");
+        match cpu_verify(&bogus) {
+            Verification::Mismatch { cpu_digest } => {
+                assert_ne!(cpu_digest, bogus.digest);
+                assert_eq!(cpu_digest, real_digest(8));
+            }
+            other => panic!("expected a mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parameters_the_cpu_cannot_hash_are_unavailable_not_a_mismatch() {
+        // Argon2 refuses m < 8. "I could not check" must never read as "this is wrong".
+        assert!(matches!(cpu_verify(&find(1, "abcXEN11def")), Verification::Unavailable(_)));
+    }
+
+    #[test]
+    fn a_find_that_fails_the_cpu_re_check_never_reaches_the_journal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Arc::new(RecordingJournal::default());
+        let state = Arc::new(MiningState::for_test(8));
+        let woken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&woken);
+        let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&observed);
+
+        // The REAL verifier, against a digest the GPU never could have produced.
+        let sink = FindSink::new(
+            journal.clone(),
+            FallbackSink::new(dir.path().join("fallback.jsonl")),
+            Arc::clone(&state),
+            "worker-1",
+        )
+        .with_clock(|| "2026-01-01T00:00:00Z".to_owned())
+        .with_notifier(Arc::new(move || {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }))
+        .with_observer(Arc::new(move |_find, _payload| {
+            seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        assert_eq!(sink.record(&find(8, "abcXEN11def")), Capture::Rejected);
+        assert!(journal.appended().is_empty(), "a false positive must not be journaled");
+        assert!(
+            !dir.path().join("fallback.jsonl").exists(),
+            "nor written to the fallback sink"
+        );
+        assert_eq!(woken.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(
+            state.normal_blocks() + state.super_blocks() + state.xuni_blocks(),
+            0,
+            "a dropped false positive must not be counted as a find"
+        );
+        // And the pipeline is untouched: not fatal, not stopped.
+        assert!(!state.fatal_durability_failure());
+        assert!(state.is_running());
+
+        // The very next find, a genuine one, still goes through.
+        assert_eq!(
+            sink.record(&find(8, &real_digest(8))),
+            Capture::Journaled(1),
+            "one rejection must not wedge the sink"
+        );
+        assert_eq!(journal.appended().len(), 1);
+    }
+
+    #[test]
+    fn a_check_that_cannot_run_still_lets_the_find_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let journal = Arc::new(RecordingJournal::default());
+        let state = Arc::new(MiningState::for_test(1000));
+        let sink = sink_with(journal.clone(), Arc::clone(&state), dir.path())
+            .with_verifier(Arc::new(|_find| Verification::Unavailable("no hasher".to_owned())));
+
+        assert_eq!(sink.record(&find(1000, "abcXEN11def")), Capture::Journaled(1));
+        assert_eq!(journal.appended().len(), 1, "an unverifiable find is still a find");
     }
 
     #[test]

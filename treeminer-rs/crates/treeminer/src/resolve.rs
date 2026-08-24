@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use tm_dashboard::url::is_valid_dashboard_bind;
-use tm_submit::{MarginConfig, MarginMode};
+use tm_submit::{MarginConfig, MarginMode, QUIESCE_MAX_MS};
 use tm_tui::{resolve_display_mode, resolve_prompt_selection, DisplayEnv, DisplayMode, PROMPT_TEXT};
 
 use crate::appconfig::{AppConfig, AppConfigError};
@@ -33,6 +33,9 @@ pub const DEFAULT_DASHBOARD_PORT: u16 = 42069;
 pub const DEFAULT_JOURNAL_PATH: &str = "treeminer-journal.db";
 /// CPU hashing only pays near the difficulty floor.
 pub const DEFAULT_CPU_MAX_DIFFICULTY: u32 = 100;
+/// Difficulty-transition quiesce, in ms. Mirrors `tm_submit::Config::default()`; a test
+/// asserts the two never drift apart.
+pub const DEFAULT_DIFFICULTY_QUIESCE_MS: i64 = 5000;
 const MAX_CONFIGURED_KIB: i64 = 100_000_000;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -55,6 +58,8 @@ pub enum ResolveError {
     CpuWorkers { requested: i32, ceiling: u32 },
     #[error("The argument ({0}) for the CPU difficulty ceiling must be 0-100000000.")]
     CpuMaxDifficulty(i32),
+    #[error("The argument ({0}) for the difficulty quiesce must be 0-{QUIESCE_MAX_MS} ms.")]
+    DifficultyQuiesce(i32),
     #[error("The argument ({0}) for total developer fee (0-1000) is invalid.")]
     TotalDevFee(i32),
     #[error("The argument ({0}) for ecosystem developer fee address (EIP55) is invalid.")]
@@ -123,6 +128,9 @@ pub struct ResolvedConfig {
     pub gpu_streams_per_device: usize,
     pub cpu_worker_count: usize,
     pub cpu_max_difficulty: u32,
+    /// `--difficultyQuiesceMs`: how long `/verify` pauses after the observed difficulty
+    /// changes. 0 disables the hold; the submitter clamps to `tm_submit::QUIESCE_MAX_MS`.
+    pub difficulty_quiesce_ms: i64,
     /// 0 = auto (use all free GPU memory).
     pub max_batch_size: usize,
 
@@ -323,6 +331,20 @@ pub fn resolve(
         cpu_max_difficulty = requested as u32;
     }
 
+    let mut difficulty_quiesce_ms = DEFAULT_DIFFICULTY_QUIESCE_MS;
+    if let Some(requested) = cli.difficulty_quiesce_ms {
+        if requested < 0 || i64::from(requested) > QUIESCE_MAX_MS {
+            return Err(ResolveError::DifficultyQuiesce(requested));
+        }
+        difficulty_quiesce_ms = i64::from(requested);
+        startup_messages.push(if difficulty_quiesce_ms == 0 {
+            "Difficulty quiesce: disabled (finds submit across difficulty transitions)"
+                .to_string()
+        } else {
+            format!("Difficulty quiesce: {difficulty_quiesce_ms} ms after a difficulty change")
+        });
+    }
+
     // --- identity ---
     let mut app_config = AppConfig::new(&options.config_path);
     let (mut miner_address, mut eco_devfee_address, mut devfee_permillage);
@@ -419,6 +441,7 @@ pub fn resolve(
         gpu_streams_per_device,
         cpu_worker_count,
         cpu_max_difficulty,
+        difficulty_quiesce_ms,
         max_batch_size,
         display_mode,
         display_warning,

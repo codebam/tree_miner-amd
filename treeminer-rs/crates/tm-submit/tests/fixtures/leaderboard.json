@@ -1,0 +1,69 @@
+{
+  "difficulty": "100",
+  "miners": [
+    {
+      "account": "0x18C1c90101aA2D04B62a8Fa80fb8D9a574362079",
+      "blocks": 4790829,
+      "hashRate": 100000.0,
+      "rank": 1,
+      "solAddress": "93Hd48EXeid4gsHoVSXf33ZwcRe1tHh2KwfMH96i5Jux",
+      "superBlocks": 5806,
+      "xblk": 5.806e+21,
+      "xnm": 2.05468575e+25,
+      "xuni": 5.786029e+24
+    },
+    {
+      "account": "0xFAC92244EA5679e530A9A8514DF37E30e66603cf",
+      "blocks": 2235177,
+      "hashRate": 100000.0,
+      "rank": 2,
+      "solAddress": "2MAnCcaRoDKMdtUcKLL4uD3cU3GxTuGqXput2tQgYxFi",
+      "superBlocks": 2806,
+      "xblk": 2.806e+21,
+      "xnm": 1.031157e+25,
+      "xuni": 2.599177e+24
+    },
+    {
+      "account": "0x7d39f1372F95FbB67D259ac26443B69eb944F1D0",
+      "blocks": 385384,
+      "hashRate": 100000.0,
+      "rank": 47,
+      "solAddress": null,
+      "superBlocks": 504,
+      "xblk": 5.04e+20,
+      "xnm": 3.85384e+24,
+      "xuni": 6.26469e+23
+    },
+    {
+      "account": "0x66b892d59fe9d63DD0E9Fc5C5Bd6E592d06325Fc",
+      "blocks": 23970,
+      "hashRate": 100000.0,
+      "rank": 499,
+      "solAddress": "HEQayw8T2cRFHnZ6S8rDMWKt7LStyn5acRsb4BuU9rnk",
+      "superBlocks": 26,
+      "xblk": 2.6e+19,
+      "xnm": 1.3194e+23,
+      "xuni": 2.5921e+22
+    },
+    {
+      "account": "0xe2065E2cE31008A9A74Ef229909e275e269f0fE0",
+      "blocks": 23912,
+      "hashRate": 100000.0,
+      "rank": 500,
+      "solAddress": "2gMCrGXP8Yo9SEKdx8xyLp3p517y7vauLrdyv6joF1Md",
+      "superBlocks": 36,
+      "xblk": 3.6e+19,
+      "xnm": 1.6853e+23,
+      "xuni": 3.1375e+22
+    }
+  ],
+  "totalBlocks": 93803933,
+  "totalHashRate": 28,
+  "totalMiners": 91,
+  "totalXblk": 1.1704599999999295e+23,
+  "totalXblkWithSol": 1.0485899999999647e+23,
+  "totalXnm": 5.415178050000073e+26,
+  "totalXnmWithSol": 4.56855197500013e+26,
+  "totalXuni": 1.2611027600000145e+26,
+  "totalXuniWithSol": 1.122985379999988e+26
+}

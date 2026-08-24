@@ -15,6 +15,7 @@ pub mod clocktime;
 pub mod drain;
 pub mod http;
 pub mod journal;
+pub mod leaderboard;
 pub mod manager;
 pub mod margin;
 pub mod transport;
@@ -29,6 +30,10 @@ pub use clocktime::{iso_utc, parse_http_date_ms, xuni_window_at};
 pub use drain::{DifficultyTrend, DrainConfig, DrainScheduler, XuniWindowState};
 pub use http::{derive_health_probe_url, HttpTransport, HEALTH_PROBE_PATH, HEALTH_PROBE_PORT};
 pub use journal::{JournalAccess, JournalCounts, JournalError, JournalResult};
+pub use leaderboard::{
+    derive_leaderboard_url, AccountStanding, Leaderboard, LeaderboardClient, LeaderboardEntry,
+    LeaderboardError, LEADERBOARD_PATH, MAX_LEADERBOARD_BYTES, MIN_POLL_INTERVAL,
+};
 pub use manager::{
     Config, ConfirmBodyCheck, Metrics, StepResult, SubmissionManager, QUIESCE_MAX_MS,
 };

@@ -427,7 +427,8 @@ mod tests {
             Arc::clone(&state),
             "worker-1",
         )
-        .with_clock(|| "2026-01-01T00:00:00Z".to_owned());
+        .with_clock(|| "2026-01-01T00:00:00Z".to_owned())
+        .trusting_digests();
         MineDeps::new(state, Arc::new(sink), identity())
     }
 

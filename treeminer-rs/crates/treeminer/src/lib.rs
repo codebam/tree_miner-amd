@@ -49,7 +49,7 @@ pub use resolve::{resolve, ResolveError, ResolveOptions, ResolvedConfig};
 pub use backend::{DeviceFacts, GpuMiningBackend, GpuSelfTestProbe, MiningBackend};
 pub use bridge::JournalBridge;
 pub use cpuworker::{CpuMiningWorker, CpuStats, CpuWorkerConfig, CpuWorkerError};
-pub use find::{Capture, Find, FindObserver, FindSink};
+pub use find::{cpu_verify, Capture, DigestVerifier, Find, FindObserver, FindSink, Verification};
 pub use mineunit::{
     run_mining_on_device, select_work, xuni_window_open_now, IdentitySource, LoopExit, MineDeps,
     MineUnit, MiningIdentity, Work,
